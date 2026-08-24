@@ -14,16 +14,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 const (
-	magic        = "VDH1"
-	typeFormat   = 1
-	typeFrame    = 2
-	flagConfig   = 1
-	flagKeyFrame = 2
+	magic                     = "VDH1"
+	typeFormat                = 1
+	typeFrame                 = 2
+	flagConfig                = 1
+	flagKeyFrame              = 2
+	defaultH264ProfileLevelID = "42e032" // Baseline, Level 5.0
 )
 const browserHTML = `<!doctype html>
 <html lang="en">
@@ -110,22 +112,31 @@ type h264Source struct {
 	mu             sync.RWMutex
 	header         streamHeader
 	config         []byte
+	sps            []byte
+	pps            []byte
 	profileLevelID string
 	latest         *h264Frame
 	latestKey      *h264Frame
 	seq            uint64
 	changed        chan struct{}
+	keyRequest     uint64
 
 	// Diagnostics / stream state.
-	connected     bool
-	connectCount  uint64
-	frames        uint64
-	keyFrames     uint64
-	configFrames  uint64
-	bytes         uint64
-	lastFrameAt   time.Time
-	lastFrameSize int
-	lastError     string
+	connected      bool
+	connectCount   uint64
+	frames         uint64
+	keyFrames      uint64
+	configFrames   uint64
+	bytes          uint64
+	lastFrameAt    time.Time
+	lastFrameSize  int
+	lastError      string
+	pliCount       uint64
+	lastPLIAt      time.Time
+	framesSent     uint64
+	keyFramesSent  uint64
+	configSent     uint64
+	waitedNoConfig uint64
 }
 
 func main() {
@@ -169,6 +180,11 @@ type debugStatus struct {
 		LastFrameAt    string `json:"lastFrameAt,omitempty"`
 		ProfileLevelID string `json:"profileLevelId,omitempty"`
 		LastError      string `json:"lastError,omitempty"`
+		PLI            uint64 `json:"pli"`
+		FramesSent     uint64 `json:"framesSent"`
+		KeyFramesSent  uint64 `json:"keyFramesSent"`
+		ConfigSent     uint64 `json:"configSent"`
+		WaitedNoConfig uint64 `json:"waitedNoConfig"`
 	} `json:"source"`
 	WebRTC struct {
 		Note string `json:"note"`
@@ -197,6 +213,11 @@ func handleDebugStatus(src *h264Source, w http.ResponseWriter, r *http.Request) 
 	}
 	st.Source.ProfileLevelID = src.profileLevelID
 	st.Source.LastError = src.lastError
+	st.Source.PLI = src.pliCount
+	st.Source.FramesSent = src.framesSent
+	st.Source.KeyFramesSent = src.keyFramesSent
+	st.Source.ConfigSent = src.configSent
+	st.Source.WaitedNoConfig = src.waitedNoConfig
 	src.mu.RUnlock()
 	st.WebRTC.Note = "peer count is not persisted; inspect gateway log for peer state"
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -226,7 +247,10 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 	// successfully establish WebRTC but cannot initialize its H264 decoder.
 	profile := src.waitProfile(3 * time.Second)
 	if profile == "" {
-		profile = "42e01f"
+		profile = defaultH264ProfileLevelID
+		log.Printf("[H264-SDP] WARNING: no SPS received before offer; using fallback profile-level-id=%s", profile)
+	} else {
+		log.Printf("[H264-SDP] source SPS profile-level-id=%s", profile)
 	}
 
 	fmtp := "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=" + profile
@@ -266,13 +290,35 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// RTCP must be drained so PLI/NACK can be processed by Pion's interceptor stack.
+	// Drain and inspect RTCP. A PLI/FIR means the browser needs a fresh keyframe.
 	if sender := pc.GetSenders(); len(sender) > 0 {
 		go func() {
-			buf := make([]byte, 1500)
+			buf := make([]byte, 4096)
 			for {
-				if _, _, e := sender[0].Read(buf); e != nil {
+				n, _, e := sender[0].Read(buf)
+				if e != nil {
 					return
+				}
+				if n <= 0 {
+					continue
+				}
+				pkts, e := rtcp.Unmarshal(buf[:n])
+				if e != nil {
+					log.Printf("[H264-RTCP] unmarshal failed: %v", e)
+					continue
+				}
+				for _, pkt := range pkts {
+					switch pkt.(type) {
+					case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+						src.mu.Lock()
+						src.pliCount++
+						src.lastPLIAt = time.Now()
+						src.keyRequest++
+						src.mu.Unlock()
+						log.Printf("[H264-RTCP] keyframe requested by browser (%T)", pkt)
+					case *rtcp.TransportLayerNack:
+						// No source-side packet loss exists because VDH1 is TCP.
+					}
 				}
 			}
 		}()
@@ -415,16 +461,27 @@ func (s *h264Source) readOnce() error {
 			}
 
 			if flags&flagConfig != 0 || len(sps) > 0 || len(pps) > 0 {
-				cfg := annexBJoin(sps, pps)
-				if len(cfg) > 0 {
-					s.mu.Lock()
-					s.config = append(s.config[:0], cfg...)
+				s.mu.Lock()
+				if len(sps) > 0 {
+					s.sps = append([]byte(nil), sps...)
 					if p := profileLevelID(sps); p != "" {
 						s.profileLevelID = p
 					}
+				}
+				if len(pps) > 0 {
+					s.pps = append([]byte(nil), pps...)
+				}
+				if len(s.sps) > 0 && len(s.pps) > 0 {
+					s.config = annexBJoin(s.sps, s.pps)
+				}
+				cfgSize := len(s.config)
+				profile := s.profileLevelID
+				if cfgSize > 0 {
 					s.configFrames++
-					s.mu.Unlock()
-					log.Printf("H264 config: size=%d profile-level-id=%s", len(cfg), s.profileLevelID)
+				}
+				s.mu.Unlock()
+				if cfgSize > 0 {
+					log.Printf("H264 config cached: size=%d profile-level-id=%s", cfgSize, profile)
 				}
 			}
 
@@ -473,69 +530,129 @@ func (s *h264Source) waitProfile(timeout time.Duration) string {
 
 func (s *h264Source) pipeTo(track *webrtc.TrackLocalStaticSample, pc *webrtc.PeerConnection) {
 	var lastSeq uint64
-	var lastPts int64
+	var lastPtsUs int64
+	var ptsBaseUs int64 = -1
+	var seenKeyRequest uint64
 	loggedFirst := false
+
 	for {
 		s.mu.RLock()
 		ch := s.changed
 		f := s.latest
 		key := s.latestKey
 		cfg := append([]byte(nil), s.config...)
+		currentKeyRequest := s.keyRequest
 		s.mu.RUnlock()
+
+		forceKey := currentKeyRequest != seenKeyRequest
+		if forceKey {
+			seenKeyRequest = currentKeyRequest
+		}
 
 		if f == nil || (lastSeq == 0 && key == nil) {
 			select {
 			case <-ch:
-			case <-time.After(250 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):
 			}
-			if pc.ConnectionState() == webrtc.PeerConnectionStateClosed || pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
+			if pc.ConnectionState() == webrtc.PeerConnectionStateClosed ||
+				pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
 				return
 			}
 			continue
 		}
 
-		// A browser needs SPS/PPS followed by an IDR to initialize H264.
-		// Start every new peer from the newest cached IDR. Do not send a
-		// configuration-only frame as the first media sample.
 		if lastSeq == 0 {
+			// Never start a peer on a P-frame. Decoder configuration and IDR
+			// are both mandatory for the first sample.
+			if key == nil || len(cfg) == 0 {
+				s.mu.Lock()
+				s.waitedNoConfig++
+				s.mu.Unlock()
+				select {
+				case <-ch:
+				case <-time.After(100 * time.Millisecond):
+				}
+				continue
+			}
 			f = key
-		}
-		if f == nil || f.seq == lastSeq {
+		} else if forceKey && key != nil {
+			f = key
+		} else if f.seq == lastSeq {
 			select {
 			case <-ch:
-			case <-time.After(250 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):
 			}
 			continue
 		}
 
-		lastSeq = f.seq
 		data := f.data
-		if f.flags&flagKeyFrame != 0 && len(cfg) > 0 && !containsSPSPPS(data) {
+		isKey := f.flags&flagKeyFrame != 0
+
+		// Every keyframe delivered to a peer is made self-contained:
+		// SPS + PPS + IDR. This also recovers after a decoder reset or PLI.
+		if isKey && len(cfg) > 0 && !containsSPSPPS(data) {
 			merged := make([]byte, 0, len(cfg)+len(data))
 			merged = append(merged, cfg...)
 			merged = append(merged, data...)
 			data = merged
 		}
 
+		if isKey && !containsSPSPPS(data) {
+			s.mu.Lock()
+			s.waitedNoConfig++
+			s.mu.Unlock()
+			select {
+			case <-ch:
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+
+		if ptsBaseUs < 0 {
+			ptsBaseUs = f.ptsUs
+		}
+		relativePtsUs := f.ptsUs - ptsBaseUs
+		if relativePtsUs < 0 {
+			relativePtsUs = 0
+		}
+
 		dur := time.Second / 30
-		if lastPts > 0 && f.ptsUs > lastPts {
-			d := time.Duration(f.ptsUs-lastPts) * time.Microsecond
-			if d > 0 && d < time.Second {
+		if lastSeq != 0 && relativePtsUs > lastPtsUs {
+			d := time.Duration(relativePtsUs-lastPtsUs) * time.Microsecond
+			if d >= time.Millisecond && d <= 500*time.Millisecond {
 				dur = d
 			}
 		}
-		lastPts = f.ptsUs
+		lastPtsUs = relativePtsUs
 
 		if err := track.WriteSample(media.Sample{Data: data, Duration: dur}); err != nil {
 			log.Printf("WebRTC WriteSample failed: %v", err)
 			_ = pc.Close()
 			return
 		}
+
+		s.mu.Lock()
+		s.framesSent++
+		if isKey {
+			s.keyFramesSent++
+			s.configSent++
+		}
+		s.mu.Unlock()
+
+		lastSeq = f.seq
 		if !loggedFirst {
-			log.Printf("WebRTC first H264 sample: seq=%d key=%t size=%d duration=%s", f.seq, f.flags&flagKeyFrame != 0, len(data), dur)
+			s.mu.RLock()
+			profile := s.profileLevelID
+			s.mu.RUnlock()
+			log.Printf(
+				"WebRTC first H264 sample: seq=%d pts=%d key=%t size=%d duration=%s selfContained=%t profile-level-id=%s",
+				f.seq, f.ptsUs, isKey, len(data), dur, containsSPSPPS(data), profile,
+			)
 			loggedFirst = true
 		}
-		if pc.ConnectionState() == webrtc.PeerConnectionStateClosed || pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
+
+		if pc.ConnectionState() == webrtc.PeerConnectionStateClosed ||
+			pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
 			return
 		}
 	}

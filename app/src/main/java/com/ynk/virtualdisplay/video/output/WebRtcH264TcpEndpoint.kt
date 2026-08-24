@@ -46,21 +46,26 @@ class WebRtcH264TcpEndpoint(
         private const val VERSION = 1
         private const val TYPE_FORMAT = 1
         private const val TYPE_FRAME = 2
-        private const val DEFAULT_QUEUE_CAPACITY = 4
+        private const val DEFAULT_QUEUE_CAPACITY = 12
         private const val SOCKET_BACKLOG = 8
         private const val ACCEPT_READ_TIMEOUT_MS = 1000
     }
 
-    private data class FramePacket(val bytes: ByteArray)
+    private data class FramePacket(val bytes: ByteArray, val isConfig: Boolean = false, val isKeyFrame: Boolean = false)
 
     private class Client(
         private val socket: Socket,
         queueCapacity: Int,
-        private val currentWidth: () -> Int,
-        private val currentHeight: () -> Int,
+        private val initialFormat: () -> Pair<Int, Int>,
         private val displayId: Int,
+        initialConfig: FramePacket?,
+        initialKey: FramePacket?,
     ) : AutoCloseable {
-        private val queue = LinkedBlockingDeque<FramePacket>(queueCapacity)
+
+        private val queue = LinkedBlockingDeque<FramePacket>(queueCapacity.coerceAtLeast(8))
+        @Volatile private var pendingConfig: FramePacket? = initialConfig
+        @Volatile private var pendingKey: FramePacket? = initialKey
+
         private val closed = AtomicBoolean(false)
         private val writer = Thread({ runWriter() }, "webrtc-h264-writer-${socket.port}")
 
@@ -74,8 +79,18 @@ class WebRtcH264TcpEndpoint(
             writer.start()
         }
 
-        fun offer(packet: FramePacket) {
+        fun offer(packet: FramePacket, critical: Boolean) {
             if (closed.get()) return
+
+            if (critical) {
+                if (packet.isConfig) {
+                    pendingConfig = packet
+                } else if (packet.isKeyFrame) {
+                    pendingKey = packet
+                }
+                return
+            }
+
             if (!queue.offerLast(packet)) {
                 queue.pollFirst()
                 queue.offerLast(packet)
@@ -84,30 +99,54 @@ class WebRtcH264TcpEndpoint(
 
         fun offerFormat(width: Int, height: Int) {
             if (closed.get()) return
+            // A resize/reset starts a new decoder session. Never replay CSD/IDR
+            // from the previous resolution before the new format metadata.
+            pendingConfig = null
+            pendingKey = null
             val out = java.io.ByteArrayOutputStream(9)
             DataOutputStream(out).use { data ->
                 data.writeByte(TYPE_FORMAT)
                 data.writeInt(width)
                 data.writeInt(height)
             }
-            offer(FramePacket(out.toByteArray()))
+            queue.clear()
+            queue.offerLast(FramePacket(out.toByteArray()))
         }
 
         private fun runWriter() {
             try {
                 val out = BufferedOutputStream(socket.getOutputStream(), 64 * 1024)
                 val data = DataOutputStream(out)
+                val (headerWidth, headerHeight) = initialFormat()
                 data.write(MAGIC)
                 data.writeInt(VERSION)
                 data.writeInt(displayId)
-                data.writeInt(currentWidth())
-                data.writeInt(currentHeight())
+                data.writeInt(headerWidth)
+                data.writeInt(headerHeight)
                 data.flush()
 
                 while (!closed.get()) {
-                    val packet = queue.takeFirst()
-                    data.write(packet.bytes)
-                    data.flush()
+                    val config = pendingConfig
+                    if (config != null) {
+                        pendingConfig = null
+                        data.write(config.bytes)
+                        data.flush()
+                        continue
+                    }
+
+                    val key = pendingKey
+                    if (key != null) {
+                        pendingKey = null
+                        data.write(key.bytes)
+                        data.flush()
+                        continue
+                    }
+
+                    val packet = queue.pollFirst(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    if (packet != null) {
+                        data.write(packet.bytes)
+                        data.flush()
+                    }
                 }
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
@@ -120,12 +159,13 @@ class WebRtcH264TcpEndpoint(
 
         override fun close() {
             if (!closed.compareAndSet(false, true)) return
+            pendingConfig = null
+            pendingKey = null
             queue.clear()
             writer.interrupt()
             runCatching { socket.close() }
         }
     }
-
 
     private val running = AtomicBoolean(false)
     private val clients = CopyOnWriteArraySet<Client>()
@@ -134,6 +174,8 @@ class WebRtcH264TcpEndpoint(
     @Volatile private var acceptThread: Thread? = null
     @Volatile private var width = 0
     @Volatile private var height = 0
+    @Volatile private var latestConfig: FramePacket? = null
+    @Volatile private var latestKeyFrame: FramePacket? = null
 
     fun start() {
         synchronized(serverLock) {
@@ -157,35 +199,80 @@ class WebRtcH264TcpEndpoint(
         if (!codec.equals("H.264", ignoreCase = true)) return
         this.width = width
         this.height = height
+        // A format change starts a new H.264 decoder session; old CSD/IDR must
+        // never be replayed before the new encoder publishes fresh values.
+        latestConfig = null
+        latestKeyFrame = null
         clients.forEach { it.offerFormat(width, height) }
+        Log.i(TAG, "H.264 format updated: ${width}x${height}")
     }
 
     override fun onFrame(ptsUs: Long, isConfig: Boolean, isKeyFrame: Boolean, data: ByteArray, size: Int) {
-        if (!running.get() || clients.isEmpty() || size <= 0) return
+        if (!running.get() || size <= 0) return
 
-        // One copy per encoded frame, shared by all connected clients. The normal
-        // decoder path remains zero-copy; this branch only runs while the external
-        // endpoint is actually being consumed.
+        // The callback buffer may be reused by the video pipeline, so cached
+        // packets must own their bytes.
+        val copy = data.copyOfRange(0, size)
         val stream = java.io.ByteArrayOutputStream(1 + 8 + 4 + 4 + size)
         val out = DataOutputStream(stream)
         out.writeByte(TYPE_FRAME)
         out.writeLong(ptsUs)
+
         var flags = 0
         if (isConfig) flags = flags or 1
         if (isKeyFrame) flags = flags or 2
+
         out.writeInt(flags)
         out.writeInt(size)
-        out.write(data, 0, size)
+        out.write(copy)
         out.flush()
-        val shared = FramePacket(stream.toByteArray())
-        clients.forEach { it.offer(shared) }
+
+        val packet = FramePacket(
+            bytes = stream.toByteArray(),
+            isConfig = isConfig,
+            isKeyFrame = isKeyFrame
+        )
+
+        // Always cache decoder-critical packets. A newly connected gateway can
+        // therefore start immediately with SPS/PPS + IDR without waiting for
+        // the next keyframe interval.
+        if (isConfig) {
+            latestConfig = packet
+            latestKeyFrame = null
+            Log.i(TAG, "H.264 CONFIG received from encoder: pts=$ptsUs size=$size head=${hexPrefix(copy, 32)}")
+        }
+        if (isKeyFrame) {
+            latestKeyFrame = packet
+            Log.i(TAG, "H.264 KEY received from encoder: pts=$ptsUs size=$size")
+        }
+
+        if (clients.isEmpty()) return
+
+        clients.forEach { it.offer(packet, critical = isConfig || isKeyFrame) }
+    }
+
+    private fun hexPrefix(bytes: ByteArray, max: Int): String {
+        val n = minOf(bytes.size, max)
+        return buildString(n * 3) {
+            for (i in 0 until n) {
+                if (i > 0) append(' ')
+                append("%02x".format(bytes[i].toInt() and 0xff))
+            }
+        }
     }
 
     private fun acceptLoop(server: ServerSocket) {
         while (running.get()) {
             try {
                 val socket = server.accept()
-                val client = Client(socket, clientQueueCapacity, { width }, { height }, displayId)
+                val client = Client(
+                    socket = socket,
+                    queueCapacity = clientQueueCapacity,
+                    initialFormat = { width to height },
+                    displayId = displayId,
+                    initialConfig = latestConfig,
+                    initialKey = latestKeyFrame,
+                )
                 clients.add(client)
                 try {
                     client.start()
@@ -221,6 +308,8 @@ class WebRtcH264TcpEndpoint(
             serverSocket = null
             clients.forEach { it.close() }
             clients.clear()
+            latestConfig = null
+            latestKeyFrame = null
             acceptThread?.interrupt()
             acceptThread = null
             Log.i(TAG, "H.264 WebRTC bridge endpoint stopped")
