@@ -68,10 +68,10 @@ class ScrcpyFrameReader(private val input: InputStream) {
         val isKeyFrame = (ptsAndFlags and ScrcpyFrameFlags.FLAG_KEY_FRAME) != 0L
         val ptsUs = ptsAndFlags and ScrcpyFrameFlags.PTS_MASK
 
-        val data = ByteArray(packetSize)
-        System.arraycopy(packetBuf, 0, data, 0, packetSize)
-
-        return ScrcpyFrame(ptsUs, isConfig, isKeyFrame, data, packetSize)
+        // packetBuf is only reused by the next read. The current caller consumes the
+        // frame synchronously (MediaCodec copies it into its input buffer), so the
+        // extra per-frame allocation/copy that used to happen here is unnecessary.
+        return ScrcpyFrame(ptsUs, isConfig, isKeyFrame, packetBuf, packetSize)
     }
 
     private fun readExact(buffer: ByteArray, offset: Int, size: Int): Int {

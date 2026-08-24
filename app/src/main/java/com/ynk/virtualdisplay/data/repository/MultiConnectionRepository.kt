@@ -1,6 +1,7 @@
 package com.ynk.virtualdisplay.data.repository
 
 import android.util.Log
+import com.ynk.virtualdisplay.net.WebRtcControlHttpServer
 import android.view.InputEvent
 import android.view.Surface
 import com.ynk.virtualdisplay.data.ServerNode
@@ -33,6 +34,11 @@ class MultiConnectionRepository(
     }
 
     private val slots = ConcurrentHashMap<String, ConnectionSlot>()
+
+    private val webRtcControlServer = WebRtcControlHttpServer(
+        repositoryProvider = { activeSlot },
+        bindHost = "0.0.0.0"
+    ).also { runCatching { it.start() }.onFailure { Log.e(TAG, "Failed to start WebRTC control API", it) } }
 
     private val _activeNodeKey = MutableStateFlow<String?>(null)
     
@@ -102,7 +108,11 @@ class MultiConnectionRepository(
     override fun unbindService() { activeSlot?.unbindService() }
     override suspend fun startDaemon(): Result<Unit> = activeSlot?.startDaemon() ?: Result.failure(noActiveSlotError())
     override suspend fun stopDaemon(): Result<Unit> = activeSlot?.stopDaemon() ?: Result.failure(noActiveSlotError())
-    override fun destroyService() { slots.values.forEach { it.destroyService() }; slots.clear() }
+    override fun destroyService() {
+        slots.values.forEach { it.destroyService() }
+        slots.clear()
+        webRtcControlServer.close()
+    }
     override fun refreshDisplays() { activeSlot?.refreshDisplays() }
 
     override suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int, mirrorDisplayId: Int): Result<Int> =
@@ -145,6 +155,17 @@ class MultiConnectionRepository(
     override fun setPerformanceStatsCallback(callback: ((String) -> Unit)?) {
         activeSlot?.setPerformanceStatsCallback(callback)
     }
+
+    override fun startWebRtcH264Output(displayId: Int, bindHost: String, port: Int): Result<Unit> =
+        activeSlot?.startWebRtcH264Output(displayId, bindHost, port) ?: Result.failure(noActiveSlotError())
+
+    override fun stopWebRtcH264Output() {
+        activeSlot?.stopWebRtcH264Output()
+    }
+
+    override fun getWebRtcH264OutputStatus() =
+        activeSlot?.getWebRtcH264OutputStatus()
+            ?: com.ynk.virtualdisplay.video.output.WebRtcH264OutputStatus(false, -1, null, null, 0)
 
     private fun noActiveSlotError() = IllegalStateException("No active connection slot")
 }

@@ -9,6 +9,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.CopyOnWriteArraySet
 import kotlinx.coroutines.withContext
 import java.io.IOException
 
@@ -28,9 +29,28 @@ class VideoStreamController(
     private var decoder: H264StreamDecoder? = null
     private var tracker: PerformanceTracker? = null
     private var pingJob: kotlinx.coroutines.Job? = null
+    private val encodedVideoSinks = CopyOnWriteArraySet<EncodedVideoSink>()
+    @Volatile private var encodedWidth = 0
+    @Volatile private var encodedHeight = 0
 
     var onVideoConfig: ((codecLabel: String, width: Int, height: Int) -> Unit)? = null
     var onPerformanceStats: ((String) -> Unit)? = null
+
+    /** Add an optional encoded-video consumer. It does not create another decoder. */
+    fun addEncodedVideoSink(sink: EncodedVideoSink) {
+        encodedVideoSinks.add(sink)
+        decoder?.addEncodedVideoSink(sink)
+        val width = encodedWidth
+        val height = encodedHeight
+        if (width > 0 && height > 0) {
+            runCatching { sink.onFormat("H.264", width, height) }
+        }
+    }
+
+    fun removeEncodedVideoSink(sink: EncodedVideoSink) {
+        decoder?.removeEncodedVideoSink(sink)
+        encodedVideoSinks.remove(sink)
+    }
 
     suspend fun start(displayId: Int, surface: Surface?, w: Int, h: Int): Result<Unit> = mutex.withLock {
         Log.i(TAG, "Starting video stream for display $displayId... (surface=$surface valid=${surface?.isValid} dims=${w}x${h})")
@@ -93,8 +113,18 @@ class VideoStreamController(
                 tracker = perfTracker
             )
 
-            d.onVideoConfig = onVideoConfig
+            d.onVideoConfig = { codec, width, height ->
+                if (codec.equals("H.264", ignoreCase = true)) {
+                    encodedWidth = width
+                    encodedHeight = height
+                    encodedVideoSinks.forEach { sink ->
+                        runCatching { sink.onFormat(codec, width, height) }
+                    }
+                }
+                onVideoConfig?.invoke(codec, width, height)
+            }
             d.ultraLowLatency = com.ynk.virtualdisplay.data.AppSettings.getUltraLowLatencySync()
+            encodedVideoSinks.forEach { d.addEncodedVideoSink(it) }
             surface?.let { d.setDisplaySurface(it) }
             d.start()
             decoder = d

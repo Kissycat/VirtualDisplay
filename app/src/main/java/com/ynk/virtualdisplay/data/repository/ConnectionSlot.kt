@@ -18,6 +18,7 @@ import com.ynk.virtualdisplay.rpc.DaemonRpc
 import com.ynk.virtualdisplay.rpc.DaemonRpcState
 import com.ynk.virtualdisplay.util.ExceptionUtils
 import com.ynk.virtualdisplay.video.VideoStreamController
+import com.ynk.virtualdisplay.video.output.WebRtcH264OutputManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -83,6 +84,7 @@ class ConnectionSlot(
     private var decoderSurface: Surface? = null
     private var currentVideoWidth: Int = DEFAULT_WIDTH
     private var currentVideoHeight: Int = DEFAULT_HEIGHT
+    private val webRtcH264OutputManager = WebRtcH264OutputManager(videoController)
 
     private val reconnectLock = Any()
     @Volatile private var reconnectJob: Job? = null
@@ -252,6 +254,7 @@ class ConnectionSlot(
 
     private suspend fun performCleanup(killDaemon: Boolean) {
         runCatching { reconnectJob?.cancel() }
+        webRtcH264OutputManager.stop()
         try { videoController.stop() } catch (e: Exception) { Log.w(TAG, "stop video failed", e) }
         if (killDaemon) {
             try { remoteDataSource.exitDaemon(); kotlinx.coroutines.delay(100) }
@@ -424,6 +427,21 @@ class ConnectionSlot(
 
     override suspend fun getActiveDisplayInfos(): Result<List<DeviceMessage.DisplayInfoEntry>> =
         remoteDataSource.getActiveDisplayInfos()
+
+    override fun startWebRtcH264Output(displayId: Int, bindHost: String, port: Int): Result<Unit> {
+        if (currentStreamingDisplayId != displayId) {
+            return Result.failure(IllegalStateException(
+                "视频尚未绑定 displayId=$displayId，请先启动该显示器的视频流。"
+            ))
+        }
+        return webRtcH264OutputManager.start(displayId, bindHost, port)
+    }
+
+    override fun stopWebRtcH264Output() {
+        webRtcH264OutputManager.stop()
+    }
+
+    override fun getWebRtcH264OutputStatus() = webRtcH264OutputManager.status()
 
     override fun setVideoConfigCallback(callback: ((width: Int, height: Int) -> Unit)?) {
         videoController.onVideoConfig = { _, w, h ->

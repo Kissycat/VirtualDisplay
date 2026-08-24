@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Scrcpy Virtual Display WebRTC View</title>
+    <style>
+        body { margin: 0; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; }
+        canvas { max-width: 100%; max-height: 100vh; object-fit: contain; }
+    </style>
+</head>
+<body>
+    <canvas id="display"></canvas>
+
+    <script>
+        const canvas = document.getElementById('display');
+        const ctx = canvas.getContext('2d');
+        
+        // 利用 WebCodecs 硬件解码 H.264
+        const videoDecoder = new VideoDecoder({
+            output: frame => {
+                canvas.width = frame.displayWidth;
+                canvas.height = frame.displayHeight;
+                ctx.drawImage(frame, 0, 0);
+                frame.close();
+            },
+            error: e => console.error("VideoDecoder error:", e)
+        });
+
+        videoDecoder.configure({
+            codec: 'avc1.42E01E', // Baseline Profile, 支持广大浏览器
+            optimizeForLatency: true
+        });
+
+        const pc = new RTCPeerConnection();
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+
+        pc.ondatachannel = (event) => {
+            const dc = event.channel;
+            dc.binaryType = 'arraybuffer';
+            dc.onmessage = (e) => {
+                const data = new Uint8Array(e.data);
+                const isKeyFrame = data[0] === 1;
+                const naluData = data.subarray(9); // 跳过 Header
+
+                // 构建 WebCodecs EncodedVideoChunk
+                const chunk = new EncodedVideoChunk({
+                    type: isKeyFrame ? 'key' : 'delta',
+                    timestamp: performance.now() * 1000,
+                    data: naluData
+                });
+                
+                videoDecoder.decode(chunk);
+            };
+        };
+
+        ws.onopen = async () => {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
+        };
+
+        ws.onmessage = async (msg) => {
+            const data = JSON.parse(msg.data);
+            if (data.type === 'answer') {
+                await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: data.sdp }));
+            } else if (data.type === 'candidate') {
+                await pc.addIceCandidate(data.candidate);
+            }
+        };
+
+        pc.onicecandidate = (e) => {
+            if (e.candidate) {
+                ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
+            }
+        };
+    </script>
+</body>
+</html>

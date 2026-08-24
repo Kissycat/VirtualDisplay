@@ -43,3 +43,16 @@
 ## 开源协议
 
 本项目基于 [Apache License 2.0](LICENSE) 协议开源。
+## Browser WebRTC output
+
+After the app starts, the control API listens on `0.0.0.0:18081`. The H.264 bridge is started on demand (default `0.0.0.0:18080`).
+
+1. Start a video stream for the target display in the app.
+2. Start H.264 output:
+   `curl -X POST http://<android-ip>:18081/api/webrtc/start -H 'Content-Type: application/json' -d '{"displayId":3,"bindHost":"0.0.0.0","port":18080}'`
+3. Run `webrtc-gateway` with `ANDROID_H264=<android-ip>:18080`.
+4. Open `http://<gateway-ip>:19000/` in Chrome/Edge.
+5. Stop output when no browser needs the stream:
+   `curl -X POST http://<android-ip>:18081/api/webrtc/stop`
+
+This path reuses the existing H.264 encoder. The Android side does not add a second video encoder.

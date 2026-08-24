@@ -17,6 +17,7 @@ import com.ynk.virtualdisplay.rpc.DaemonRpc
 import com.ynk.virtualdisplay.rpc.DaemonRpcState
 import com.ynk.virtualdisplay.util.ExceptionUtils
 import com.ynk.virtualdisplay.video.VideoStreamController
+import com.ynk.virtualdisplay.video.output.WebRtcH264OutputManager
 import com.ynk.virtualdisplay.util.NetUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -85,6 +86,7 @@ class DaemonDisplayRepository(
     private var decoderSurface: Surface? = null
     private var currentVideoWidth: Int = DEFAULT_WIDTH
     private var currentVideoHeight: Int = DEFAULT_HEIGHT
+    private val webRtcH264OutputManager = WebRtcH264OutputManager(videoController)
 
     // Guards the automatic-reconnect job so only one reconnect loop is ever
     // in flight. Without this, a burst of LOOP_EXITED_ABNORMALLY emissions
@@ -326,6 +328,7 @@ class DaemonDisplayRepository(
         // otherwise it races exitDaemon/transport.disconnect and re-opens
         // sockets that we are about to kill.
         runCatching { reconnectJob?.cancel() }
+        webRtcH264OutputManager.stop()
         try { videoController.stop() } catch (e: Exception) { Log.w(TAG, "Failed to stop video streaming", e) }
         
         if (killDaemon) {
@@ -570,6 +573,21 @@ class DaemonDisplayRepository(
         _daemonPid.value = -1
         Result.success(Unit)
     }
+
+    override fun startWebRtcH264Output(displayId: Int, bindHost: String, port: Int): Result<Unit> {
+        if (currentStreamingDisplayId != displayId) {
+            return Result.failure(IllegalStateException(
+                "视频尚未绑定 displayId=$displayId，请先启动该显示器的视频流。"
+            ))
+        }
+        return webRtcH264OutputManager.start(displayId, bindHost, port)
+    }
+
+    override fun stopWebRtcH264Output() {
+        webRtcH264OutputManager.stop()
+    }
+
+    override fun getWebRtcH264OutputStatus() = webRtcH264OutputManager.status()
 
     override fun setVideoConfigCallback(callback: ((width: Int, height: Int) -> Unit)?) {
         videoController.onVideoConfig = { _, w, h ->

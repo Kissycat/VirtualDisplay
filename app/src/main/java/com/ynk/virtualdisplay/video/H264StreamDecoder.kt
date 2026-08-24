@@ -45,6 +45,16 @@ class H264StreamDecoder(
     var onVideoConfig: ((codecLabel: String, width: Int, height: Int) -> Unit)? = null
     var ultraLowLatency: Boolean = false
 
+    private val encodedVideoBroadcaster = EncodedVideoFrameBroadcaster()
+
+    fun addEncodedVideoSink(sink: EncodedVideoSink) {
+        encodedVideoBroadcaster.add(sink)
+    }
+
+    fun removeEncodedVideoSink(sink: EncodedVideoSink) {
+        encodedVideoBroadcaster.remove(sink)
+    }
+
     @Volatile private var renderScheduler: SurfaceRenderScheduler? = null
 
     init {
@@ -207,6 +217,15 @@ class H264StreamDecoder(
                     Log.i(TAG, "First frame received: size=${frame.size} pts=${frame.ptsUs} isConfig=${frame.isConfig} isKeyFrame=${frame.isKeyFrame}")
                 }
                 tracker.recordReceived(frame.size)
+                if (!encodedVideoBroadcaster.isEmpty()) {
+                    encodedVideoBroadcaster.publishFrame(
+                        ptsUs = frame.ptsUs,
+                        isConfig = frame.isConfig,
+                        isKeyFrame = frame.isKeyFrame,
+                        data = frame.data,
+                        size = frame.size
+                    )
+                }
                 if (!frame.isConfig && frame.ptsUs >= 0L) {
                     tracker.recordFrameReceived(frame.ptsUs)
                 }
@@ -387,6 +406,7 @@ class H264StreamDecoder(
                             width = visibleWidth
                             height = visibleHeight
                             Log.i(TAG, "Output format changed: coded=${w}x${h} visible=${visibleWidth}x${visibleHeight}")
+                            encodedVideoBroadcaster.publishFormat("H.264", visibleWidth, visibleHeight)
                             onVideoConfig?.invoke("H.264", visibleWidth, visibleHeight)
                         }
                         outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {

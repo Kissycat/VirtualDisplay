@@ -1,0 +1,89 @@
+--- a/app/src/main/java/com/ynk/virtualdisplay/data/repository/IDisplayRepository.kt
++++ b/app/src/main/java/com/ynk/virtualdisplay/data/repository/IDisplayRepository.kt
+@@ -6,6 +6,7 @@
+ import com.ynk.virtualdisplay.data.AppSettings
+ import com.ynk.virtualdisplay.protocol.DeviceMessage
+ import kotlinx.coroutines.flow.StateFlow
++import java.nio.ByteBuffer
+ 
+ /**
+  * 状态枚举定义
+@@ -95,6 +96,9 @@
+     /** 设置视频配置回调 */
+     fun setVideoConfigCallback(callback: ((width: Int, height: Int) -> Unit)?)
+ 
++    /** 设置原始 scrcpy H.264 帧回调 */
++    fun setRawH264FrameCallback(callback: ((buffer: ByteBuffer, ptsMs: Long, isKeyFrame: Boolean) -> Unit)?)
++
+     /** 设置性能统计回调 */
+     fun setPerformanceStatsCallback(callback: ((String) -> Unit)?)
+ 
+--- a/app/src/main/java/com/ynk/virtualdisplay/data/repository/ConnectionSlot.kt
++++ b/app/src/main/java/com/ynk/virtualdisplay/data/repository/ConnectionSlot.kt
+@@ -30,6 +30,7 @@
+ import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.withContext
+ import kotlinx.coroutines.withTimeoutOrNull
++import java.nio.ByteBuffer
+ 
+ /**
+  * 单条服务端连接的全部资源封装。
+@@ -432,6 +433,12 @@
+         }
+     }
+ 
++    override fun setRawH264FrameCallback(
++        callback: ((buffer: ByteBuffer, ptsMs: Long, isKeyFrame: Boolean) -> Unit)?
++    ) {
++        videoController.onRawH264FrameCaptured = callback
++    }
++
+     override fun setPerformanceStatsCallback(callback: ((String) -> Unit)?) {
+         videoController.onPerformanceStats = callback
+     }
+--- a/app/src/main/java/com/ynk/virtualdisplay/data/repository/DaemonDisplayRepository.kt
++++ b/app/src/main/java/com/ynk/virtualdisplay/data/repository/DaemonDisplayRepository.kt
+@@ -30,6 +30,7 @@
+ import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.withContext
+ import kotlinx.coroutines.withTimeoutOrNull
++import java.nio.ByteBuffer
+ 
+ /**
+  * 显示器仓库实现：协调 DataSource + 传输/视频流组件，完成虚拟显示器的管理。
+@@ -579,6 +580,12 @@
+         }
+     }
+ 
++    override fun setRawH264FrameCallback(
++        callback: ((buffer: ByteBuffer, ptsMs: Long, isKeyFrame: Boolean) -> Unit)?
++    ) {
++        videoController.onRawH264FrameCaptured = callback
++    }
++
+     override fun setPerformanceStatsCallback(callback: ((String) -> Unit)?) {
+         videoController.onPerformanceStats = callback
+     }
+--- a/app/src/main/java/com/ynk/virtualdisplay/data/repository/MultiConnectionRepository.kt
++++ b/app/src/main/java/com/ynk/virtualdisplay/data/repository/MultiConnectionRepository.kt
+@@ -9,6 +9,7 @@
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.flow.*
+ import java.util.concurrent.ConcurrentHashMap
++import java.nio.ByteBuffer
+ 
+ /**
+  * 多连接路由层：管理所有 [ConnectionSlot]，并实现 [IDisplayRepository]（路由到活跃槽）。
+@@ -142,6 +143,12 @@
+         activeSlot?.setVideoConfigCallback(callback)
+     }
+ 
++    override fun setRawH264FrameCallback(
++        callback: ((buffer: ByteBuffer, ptsMs: Long, isKeyFrame: Boolean) -> Unit)?
++    ) {
++        activeSlot?.setRawH264FrameCallback(callback)
++    }
++
+     override fun setPerformanceStatsCallback(callback: ((String) -> Unit)?) {
+         activeSlot?.setPerformanceStatsCallback(callback)
+     }

@@ -6,6 +6,7 @@ import android.view.Surface
 import com.ynk.virtualdisplay.data.AppSettings
 import com.ynk.virtualdisplay.protocol.DeviceMessage
 import kotlinx.coroutines.flow.StateFlow
+import com.ynk.virtualdisplay.video.output.WebRtcH264OutputStatus
 
 /**
  * 状态枚举定义
@@ -97,6 +98,20 @@ interface IDisplayRepository {
 
     /** 设置性能统计回调 */
     fun setPerformanceStatsCallback(callback: ((String) -> Unit)?)
+
+    /**
+     * 启动可供 WebRTC 网关消费的 H.264 输出。
+     * 该接口只旁路已经编码的视频，不会创建第二个编码器。
+     */
+    fun startWebRtcH264Output(displayId: Int, bindHost: String = "127.0.0.1", port: Int): Result<Unit> =
+        Result.failure(UnsupportedOperationException("WebRTC H.264 output is not supported by this repository"))
+
+    /** 停止 WebRTC H.264 输出。 */
+    fun stopWebRtcH264Output() {}
+
+    /** 查询 WebRTC H.264 输出状态。 */
+    fun getWebRtcH264OutputStatus(): WebRtcH264OutputStatus =
+        WebRtcH264OutputStatus(false, -1, null, null, 0)
 
     /** 主动向守护进程拉取并同步当前管理的显示器列表 (缓存) */
     fun refreshDisplays()
