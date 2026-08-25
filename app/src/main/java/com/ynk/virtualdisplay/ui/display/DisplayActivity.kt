@@ -45,10 +45,16 @@ class DisplayActivity : ComponentActivity() {
     companion object {
         private const val TAG = "DisplayActivity"
 
-        fun createIntent(context: Context, displayId: Int, nodeKey: String? = null): Intent {
+        fun createIntent(
+            context: Context,
+            displayId: Int,
+            nodeKey: String? = null,
+            desktopMode: Boolean = false
+        ): Intent {
             return Intent(context, DisplayActivity::class.java).apply {
                 putExtra("display_id", displayId)
                 putExtra("node_key", nodeKey)
+                putExtra("desktop_mode", desktopMode)
             }
         }
     }
@@ -58,6 +64,8 @@ class DisplayActivity : ComponentActivity() {
     private var videoWidth = 0
     private var videoHeight = 0
     private var currentVideoRotation = 0
+    private var desktopMode = false
+    private var desktopWebRtcRunning = false
 
     // Tracks the surface reported by VideoSurfaceView before videoWidth/Height
     // are known. Without this, onSurfaceAvailable drops the surface when
@@ -68,6 +76,7 @@ class DisplayActivity : ComponentActivity() {
 
     private var resizeJob: Job? = null
     private var remoteDisplayMonitorJob: Job? = null
+    private var desktopWebRtcMonitorJob: Job? = null
     private val isLocalNode: Boolean = AppSettings.getCurrentServerNodeSync().isLocal
 
     private lateinit var rootLayout: FrameLayout
@@ -117,6 +126,7 @@ class DisplayActivity : ComponentActivity() {
         require(displayId != -1) { "Invalid display_id" }
         remoteDisplayId = displayId
         nodeKey = intent.getStringExtra("node_key")
+        desktopMode = intent.getBooleanExtra("desktop_mode", false)
 
         requestHighRefreshRate()
         enterFullscreen()
@@ -127,6 +137,7 @@ class DisplayActivity : ComponentActivity() {
             displayIdProvider = { remoteDisplayId },
             scope = lifecycleScope,
         )
+        inputController.setTrackpadModeEnabled(false)
 
         backCallback = object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -161,6 +172,9 @@ class DisplayActivity : ComponentActivity() {
         }
         updateDisplayInfo(displayId)
         startDisconnectDetection(displayId)
+        if (desktopMode) {
+            startDesktopWebRtcMonitor()
+        }
 
         repository.setPerformanceStatsCallback { stats ->
             lifecycleScope.launch(Dispatchers.Main) {
@@ -184,6 +198,7 @@ class DisplayActivity : ComponentActivity() {
         repository.setVideoConfigCallback(null)
         resizeJob?.cancel()
         remoteDisplayMonitorJob?.cancel()
+        desktopWebRtcMonitorJob?.cancel()
         if (isLocalNode) {
             val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
             dm.unregisterDisplayListener(displayListener)
@@ -289,10 +304,18 @@ class DisplayActivity : ComponentActivity() {
             })
         }
         rootLayout.addView(videoSurfaceView)
-
         controlPanel = DisplayControlPanel(
             context = this,
             onBackClick = { inputController.injectKey(KeyEvent.KEYCODE_BACK) },
+            onDesktopHomeClick = {
+                val id = remoteDisplayId
+                if (desktopMode && id != null) {
+                    lifecycleScope.launch {
+                        repository.launchHome(id)
+                            .onFailure { Log.w(TAG, "Failed to return to virtual desktop home", it) }
+                    }
+                }
+            },
             onAppLauncherClick = { showAppSelectionDialog() },
             onKeyboardClick = { toggleKeyboard() },
             onCloseClick = { finish() },
@@ -317,6 +340,61 @@ class DisplayActivity : ComponentActivity() {
         rootLayout.addView(statsOverlay)
 
         setContentView(rootLayout)
+    }
+
+    private fun startDesktopWebRtcMonitor() {
+        desktopWebRtcMonitorJob?.cancel()
+        desktopWebRtcMonitorJob = lifecycleScope.launch {
+            while (!isFinishing && !isDestroyed) {
+                val running = repository.getWebRtcH264OutputStatus().running
+                if (running != desktopWebRtcRunning) {
+                    desktopWebRtcRunning = running
+                    updateDesktopWebRtcUi(running)
+                }
+                kotlinx.coroutines.delay(300)
+            }
+        }
+    }
+
+    private fun updateDesktopWebRtcUi(running: Boolean) {
+        if (!desktopMode) return
+
+        if (running) {
+            // WebRTC mode turns the phone surface into a pure mouse/trackpad.
+            // Cancel any touch gesture which may have started before WebRTC
+            // became active, otherwise the old touchscreen stream can continue
+            // scrolling/clicking the remote app while the mouse is also moving.
+            inputController.cancelActiveTouch()
+            inputController.setTrackpadModeEnabled(true)
+
+            // Stop local decode/rendering as soon as the H.264/WebRTC output is
+            // active. The display activity becomes a low-latency touchpad.
+            if (::videoSurfaceView.isInitialized) {
+                videoSurfaceView.visibility = View.INVISIBLE
+            }
+            // Keep the existing floating control panel: back/app/keyboard/close
+            // controls are still needed while the phone is used as a trackpad.
+            if (::controlPanel.isInitialized) {
+                controlPanel.visibility = View.VISIBLE
+            }
+            if (::statsOverlay.isInitialized) {
+                statsOverlay.visibility = View.GONE
+            }
+            DesktopCursorState.reset(1920, 1080)
+            rootLayout.setBackgroundColor(Color.rgb(28, 28, 28))
+            Log.i(TAG, "Desktop mode: WebRTC is running, local video hidden; mouse/trackpad-only input enabled")
+        } else {
+            inputController.setTrackpadModeEnabled(false)
+            inputController.cancelActiveTouch()
+            if (::videoSurfaceView.isInitialized) {
+                videoSurfaceView.visibility = View.VISIBLE
+            }
+            if (::controlPanel.isInitialized) {
+                controlPanel.visibility = View.VISIBLE
+            }
+            rootLayout.setBackgroundColor(Color.BLACK)
+            Log.i(TAG, "Desktop mode: WebRTC stopped, local video restored")
+        }
     }
 
     private fun setVideoSurface(surface: Surface?) {
@@ -512,8 +590,58 @@ class DisplayActivity : ComponentActivity() {
         Log.d(TAG, "Keyboard ${if (willEnable) "shown" else "hidden"}")
     }
 
+    /**
+     * Desktop mode has exactly one touch entry point. We consume every touch
+     * gesture outside the floating control panel here, before Android dispatches
+     * it to VideoSurfaceView/root children. This prevents a second listener or
+     * child view from producing a legacy touchscreen stream for the same finger
+     * sequence.
+     *
+     * Normal mode deliberately delegates to the framework, preserving the
+     * original rootLayout touch listener and touchscreen injection path.
+     */
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (!desktopMode) {
+            return super.dispatchTouchEvent(event)
+        }
+
+        val inControlPanel = ::controlPanel.isInitialized &&
+            isPointInsideView(event.rawX, event.rawY, controlPanel)
+
+        if (inControlPanel) {
+            // Let the actual floating buttons receive their normal click events.
+            return super.dispatchTouchEvent(event)
+        }
+
+        if (::inputController.isInitialized && ::rootLayout.isInitialized) {
+            inputController.handleTrackpadEvent(rootLayout, event)
+        }
+
+        // Hard-consume the event so VideoSurfaceView and rootLayout never see
+        // the same gesture after the desktop trackpad has handled it.
+        return true
+    }
+
+    private fun isPointInsideView(rawX: Float, rawY: Float, view: View): Boolean {
+        val location = IntArray(2)
+        view.getLocationOnScreen(location)
+        return rawX >= location[0] &&
+            rawX < location[0] + view.width &&
+            rawY >= location[1] &&
+            rawY < location[1] + view.height
+    }
+
     @SuppressLint("RestrictedApi")
     private fun handleTouchEvent(event: MotionEvent): Boolean {
+        if (desktopMode) {
+            // Desktop mode is a hard input boundary: the phone surface is always
+            // a trackpad. Never fall through to the legacy touchscreen path,
+            // regardless of WebRTC polling timing or local video visibility.
+            // This removes the race that allowed MOVE events to be injected as
+            // SOURCE_TOUCHSCREEN while the software mouse was moving.
+            return inputController.handleTrackpadEvent(rootLayout, event)
+        }
+
         val shouldHandleRemotely = (inputController.shouldHandleRemotely(event)) &&
             (isInsideVideoArea(event) || event.actionMasked == MotionEvent.ACTION_DOWN)
 
@@ -601,7 +729,7 @@ class DisplayActivity : ComponentActivity() {
                             val selectedApp = sortedAppList[which]
                             val id = remoteDisplayId ?: return@setItems
                             lifecycleScope.launch {
-                                repository.launchApp(selectedApp.packageName, id)
+                                repository.launchApp(selectedApp.packageName, id, freeform = false)
                             }
                         }
                         .setNegativeButton("取消", null)

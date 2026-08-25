@@ -348,10 +348,10 @@ class ConnectionSlot(
     override fun getSlot(nodeKey: String): IDisplayRepository? = if (node.uniqueKey() == nodeKey) this else null
     override fun allSlots(): Collection<IDisplayRepository> = listOf(this)
 
-    override suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int, mirrorDisplayId: Int): Result<Int> {
+    override suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int, mirrorDisplayId: Int, desktopMode: Boolean): Result<Int> {
         val result = remoteDataSource.createDisplay(name, width, height, dpi, flags, mirrorDisplayId)
         result.onSuccess { displayId ->
-            AppSettings.saveDisplayForServer(context, node, SavedDisplay(displayId, name, width, height, dpi, mirrorDisplayId))
+            AppSettings.saveDisplayForServer(context, node, SavedDisplay(displayId, name, width, height, dpi, mirrorDisplayId, desktopMode = desktopMode))
             refreshManagedDisplays()
         }
         return result
@@ -404,8 +404,8 @@ class ConnectionSlot(
         return result
     }
 
-    override suspend fun launchApp(packageName: String, displayId: Int): Result<Int> {
-        val result = remoteDataSource.startActivity(packageName, displayId)
+    override suspend fun launchApp(packageName: String, displayId: Int, freeform: Boolean): Result<Int> {
+        val result = remoteDataSource.startActivity(packageName, displayId, freeform)
         result.onSuccess { settingsDataSource.addRecentApp(packageName) }
         return result
     }

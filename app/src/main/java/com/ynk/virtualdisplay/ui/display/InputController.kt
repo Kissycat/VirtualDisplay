@@ -44,6 +44,52 @@ class InputController(
     private val activePointerIds = linkedSetOf<Int>()
     private val activePointerPositions = linkedMapOf<Int, Pair<Float, Float>>()
 
+    // Desktop-mode trackpad state. The virtual display receives absolute mouse
+    // coordinates, so the phone touchpad maintains an internal cursor position
+    // and converts finger deltas into absolute mouse moves.
+    private var trackpadCursorX = 0f
+    private var trackpadCursorY = 0f
+    private var trackpadLastX = 0f
+    private var trackpadLastY = 0f
+    private var trackpadDownX = 0f
+    private var trackpadDownY = 0f
+    private var trackpadDragArmX = 0f
+    private var trackpadDragArmY = 0f
+    private var trackpadDownTime = 0L
+    private var trackpadMoved = false
+    private var trackpadTapCancelled = false
+    private var trackpadDragging = false
+    private var trackpadModeEnabled = false
+    private var trackpadLongPressStarted = false
+    private var trackpadLongPressConsumed = false
+    private var trackpadTwoFingerStartY = 0f
+    private var trackpadTwoFingerLastY = 0f
+    private var trackpadTwoFinger = false
+    private val trackpadSensitivity = 0.72f
+    // Movement before the long-press deadline cancels tap/drag qualification.
+    private val trackpadMoveThreshold = 26f
+    // After a stationary long-press, this smaller movement starts a drag.
+    private val trackpadDragStartThreshold = 8f
+    private val trackpadLongPressMs = 320L
+
+    fun setTrackpadModeEnabled(enabled: Boolean) {
+        if (trackpadModeEnabled == enabled) return
+        trackpadModeEnabled = enabled
+        if (!enabled) {
+            val displayId = displayIdProvider()
+            if (displayId != null && trackpadDragging) {
+                injectMouseUp(displayId)
+            }
+            trackpadDragging = false
+            trackpadLongPressStarted = false
+            trackpadLongPressConsumed = false
+            trackpadTwoFinger = false
+            trackpadMoved = false
+            trackpadTapCancelled = false
+        }
+        Log.i(TAG, "trackpadModeEnabled=$enabled")
+    }
+
     fun updateVideoSize(width: Int, height: Int) {
         videoWidth = width
         videoHeight = height
@@ -73,6 +119,295 @@ class InputController(
             event.actionMasked == MotionEvent.ACTION_CANCEL -> handleCancel(view)
             else -> handleTouchEvent(view, event)
         }
+    }
+
+    /**
+     * Desktop-mode touchpad. Single-finger movement controls an absolute mouse
+     * cursor; tap = left click, drag = left-button drag, two-finger vertical
+     * movement = wheel scroll, two-finger tap = right click.
+     */
+    fun handleTrackpadEvent(view: View, event: MotionEvent): Boolean {
+        if (!trackpadModeEnabled || !hasVideoSize()) return true
+        val displayId = displayIdProvider() ?: return false
+
+        if (trackpadCursorX <= 0f && trackpadCursorY <= 0f) {
+            trackpadCursorX = videoWidth * 0.5f
+            trackpadCursorY = videoHeight * 0.5f
+            DesktopCursorState.reset(videoWidth, videoHeight)
+        }
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                trackpadDownTime = event.eventTime
+                trackpadLastX = event.x
+                trackpadLastY = event.y
+                trackpadDownX = event.x
+                trackpadDownY = event.y
+                trackpadDragArmX = event.x
+                trackpadDragArmY = event.y
+                trackpadMoved = false
+                trackpadTapCancelled = false
+                trackpadDragging = false
+                trackpadLongPressStarted = false
+                trackpadLongPressConsumed = false
+                trackpadTwoFinger = false
+                trackpadTwoFingerStartY = 0f
+                trackpadTwoFingerLastY = 0f
+                return true
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (event.pointerCount >= 2) {
+                    trackpadTwoFinger = true
+                    val idx = event.findPointerIndex(event.getPointerId(0))
+                    val idx2 = event.findPointerIndex(event.getPointerId(1))
+                    if (idx >= 0 && idx2 >= 0) {
+                        val y = (event.getY(idx) + event.getY(idx2)) * 0.5f
+                        trackpadTwoFingerStartY = y
+                        trackpadTwoFingerLastY = y
+                    }
+                    if (trackpadDragging) {
+                        injectMouseUp(displayId)
+                        trackpadDragging = false
+                    }
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (event.pointerCount >= 2 || trackpadTwoFinger) {
+                    if (event.pointerCount >= 2) {
+                        val y = (event.getY(0) + event.getY(1)) * 0.5f
+                        if (trackpadTwoFingerLastY != 0f) {
+                            val dy = y - trackpadTwoFingerLastY
+                            if (kotlin.math.abs(dy) > 0.5f) {
+                                trackpadMoved = true
+                                injectScrollEvent(
+                                    x = trackpadCursorX,
+                                    y = trackpadCursorY,
+                                    hScroll = 0f,
+                                    vScroll = dy / 72f,
+                                    buttons = 0,
+                                    displayId = displayId,
+                                )
+                            }
+                        }
+                        trackpadTwoFingerLastY = y
+                    }
+                    return true
+                }
+
+                val dx = event.x - trackpadLastX
+                val dy = event.y - trackpadLastY
+                trackpadLastX = event.x
+                trackpadLastY = event.y
+
+                val fromDownX = event.x - trackpadDownX
+                val fromDownY = event.y - trackpadDownY
+                val fromDownDistance = kotlin.math.hypot(fromDownX.toDouble(), fromDownY.toDouble()).toFloat()
+                val elapsed = event.eventTime - trackpadDownTime
+
+                // A long-press is valid only while the finger stays near the
+                // original DOWN position. Any early travel permanently cancels
+                // tap/drag qualification for this gesture, even if the finger
+                // later stops or returns to the original point.
+                if (!trackpadLongPressStarted && !trackpadTapCancelled &&
+                    fromDownDistance > trackpadMoveThreshold) {
+                    trackpadTapCancelled = true
+                    trackpadMoved = true
+                }
+
+                if (!trackpadTwoFinger && !trackpadLongPressStarted &&
+                    !trackpadTapCancelled && elapsed >= trackpadLongPressMs &&
+                    fromDownDistance <= trackpadMoveThreshold) {
+                    // Arm the drag only. Do not press the mouse button until
+                    // the finger actually moves after the long-press.
+                    trackpadLongPressStarted = true
+                    trackpadLongPressConsumed = true
+                    trackpadDragArmX = event.x
+                    trackpadDragArmY = event.y
+                }
+
+                if (dx != 0f || dy != 0f) {
+                    trackpadCursorX = (trackpadCursorX + dx * trackpadSensitivity)
+                        .coerceIn(0f, videoWidth.toFloat())
+                    trackpadCursorY = (trackpadCursorY + dy * trackpadSensitivity)
+                        .coerceIn(0f, videoHeight.toFloat())
+
+                    // Keep a software cursor synchronized with the absolute
+                    // mouse position. The Android pointer icon itself is not
+                    // part of the H.264 capture sent to WebRTC.
+                    DesktopCursorState.update(
+                        trackpadCursorX,
+                        trackpadCursorY,
+                        videoWidth,
+                        videoHeight,
+                    )
+
+                    // After a stationary long-press, require a fresh deliberate
+                    // movement before pressing/holding the left mouse button.
+                    if (!trackpadTwoFinger && trackpadLongPressStarted &&
+                        !trackpadDragging) {
+                        val armDx = event.x - trackpadDragArmX
+                        val armDy = event.y - trackpadDragArmY
+                        val armDistance = kotlin.math.hypot(armDx.toDouble(), armDy.toDouble()).toFloat()
+                        if (armDistance >= trackpadDragStartThreshold) {
+                            injectPointerEvent(
+                                action = MotionEvent.ACTION_DOWN,
+                                pointerId = POINTER_ID_MOUSE,
+                                x = trackpadCursorX,
+                                y = trackpadCursorY,
+                                videoWidth = videoWidth,
+                                videoHeight = videoHeight,
+                                pressure = 1f,
+                                actionButton = MotionEvent.BUTTON_PRIMARY,
+                                buttons = MotionEvent.BUTTON_PRIMARY,
+                                displayId = displayId,
+                                source = InputDevice.SOURCE_MOUSE,
+                            )
+                            trackpadDragging = true
+                        }
+                    }
+
+                    if (trackpadDragging) {
+                        injectPointerEvent(
+                            action = MotionEvent.ACTION_MOVE,
+                            pointerId = POINTER_ID_MOUSE,
+                            x = trackpadCursorX,
+                            y = trackpadCursorY,
+                            videoWidth = videoWidth,
+                            videoHeight = videoHeight,
+                            pressure = 1f,
+                            actionButton = 0,
+                            buttons = MotionEvent.BUTTON_PRIMARY,
+                            displayId = displayId,
+                            source = InputDevice.SOURCE_MOUSE,
+                        )
+                    } else {
+                        injectPointerEvent(
+                            action = MotionEvent.ACTION_HOVER_MOVE,
+                            pointerId = POINTER_ID_MOUSE,
+                            x = trackpadCursorX,
+                            y = trackpadCursorY,
+                            videoWidth = videoWidth,
+                            videoHeight = videoHeight,
+                            pressure = 1f,
+                            actionButton = 0,
+                            buttons = 0,
+                            displayId = displayId,
+                            source = InputDevice.SOURCE_MOUSE,
+                        )
+                    }
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (event.pointerCount <= 2) {
+                    trackpadTwoFingerLastY = 0f
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (trackpadDragging) {
+                    injectMouseUp(displayId)
+                } else if (!trackpadTapCancelled && !trackpadLongPressConsumed &&
+                    !trackpadTwoFinger && !trackpadMoved) {
+                    injectMouseClick(displayId, secondary = false)
+                } else if (!trackpadTapCancelled && !trackpadLongPressConsumed &&
+                    trackpadTwoFinger && !trackpadMoved) {
+                    injectMouseClick(displayId, secondary = true)
+                }
+
+                trackpadTwoFinger = false
+                trackpadDragging = false
+                trackpadMoved = false
+                trackpadTapCancelled = false
+                trackpadLongPressStarted = false
+                trackpadLongPressConsumed = false
+                return true
+            }
+        }
+        return true
+    }
+
+    private fun injectMouseClick(displayId: Int, secondary: Boolean) {
+        val button = if (secondary) MotionEvent.BUTTON_SECONDARY else MotionEvent.BUTTON_PRIMARY
+        injectPointerEvent(
+            action = MotionEvent.ACTION_DOWN,
+            pointerId = POINTER_ID_MOUSE,
+            x = trackpadCursorX,
+            y = trackpadCursorY,
+            videoWidth = videoWidth,
+            videoHeight = videoHeight,
+            pressure = 1f,
+            actionButton = button,
+            buttons = button,
+            displayId = displayId,
+            source = InputDevice.SOURCE_MOUSE,
+        )
+        injectPointerEvent(
+            action = MotionEvent.ACTION_UP,
+            pointerId = POINTER_ID_MOUSE,
+            x = trackpadCursorX,
+            y = trackpadCursorY,
+            videoWidth = videoWidth,
+            videoHeight = videoHeight,
+            pressure = 0f,
+            actionButton = button,
+            buttons = 0,
+            displayId = displayId,
+            source = InputDevice.SOURCE_MOUSE,
+        )
+    }
+
+    private fun injectMouseUp(displayId: Int) {
+        injectPointerEvent(
+            action = MotionEvent.ACTION_UP,
+            pointerId = POINTER_ID_MOUSE,
+            x = trackpadCursorX,
+            y = trackpadCursorY,
+            videoWidth = videoWidth,
+            videoHeight = videoHeight,
+            pressure = 0f,
+            actionButton = MotionEvent.BUTTON_PRIMARY,
+            buttons = 0,
+            displayId = displayId,
+            source = InputDevice.SOURCE_MOUSE,
+        )
+    }
+
+    /**
+     * Finish and clear any touchscreen gesture which was already active before
+     * desktop/WebRTC mode took control of the input surface. This prevents the
+     * old touch stream from continuing to affect the remote application.
+     */
+    fun cancelActiveTouch() {
+        val displayId = displayIdProvider() ?: return
+        if (activePointerIds.isEmpty()) return
+
+        val pointers = activePointerIds.toList()
+        for (pointerId in pointers) {
+            val pos = activePointerPositions[pointerId] ?: continue
+            val x = if (videoWidth > 0) pos.first.coerceIn(0f, videoWidth.toFloat()) else pos.first
+            val y = if (videoHeight > 0) pos.second.coerceIn(0f, videoHeight.toFloat()) else pos.second
+            injectPointerEvent(
+                action = MotionEvent.ACTION_UP,
+                pointerId = pointerId.toLong(),
+                x = x,
+                y = y,
+                videoWidth = videoWidth,
+                videoHeight = videoHeight,
+                pressure = 0f,
+                actionButton = 0,
+                buttons = 0,
+                displayId = displayId,
+                source = InputDevice.SOURCE_TOUCHSCREEN,
+            )
+        }
+        activePointerIds.clear()
+        activePointerPositions.clear()
     }
 
     fun handleKeyEvent(event: KeyEvent): Boolean {

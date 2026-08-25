@@ -63,7 +63,8 @@ data class SavedDisplay(
     val height: Int,
     val dpi: Int,
     val mirrorDisplayId: Int = -1,
-    val isOwned: Boolean = false
+    val isOwned: Boolean = false,
+    val desktopMode: Boolean = false
 ) {
     fun toJsonObject(): org.json.JSONObject {
         return org.json.JSONObject().apply {
@@ -74,6 +75,7 @@ data class SavedDisplay(
             put("dpi", dpi)
             put("mirrorDisplayId", mirrorDisplayId)
             put("isOwned", isOwned)
+            put("desktopMode", desktopMode)
         }
     }
 
@@ -86,7 +88,8 @@ data class SavedDisplay(
                 height = json.getInt("height"),
                 dpi = json.getInt("dpi"),
                 mirrorDisplayId = json.optInt("mirrorDisplayId", -1),
-                isOwned = json.optBoolean("isOwned", false)
+                isOwned = json.optBoolean("isOwned", false),
+                desktopMode = json.optBoolean("desktopMode", false)
             )
         }
     }

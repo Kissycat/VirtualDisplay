@@ -123,14 +123,32 @@ fun DisplayItem(
             Spacer(modifier = Modifier.height(8.dp))
             
             // 3. 详细信息
-            Text(
-                text = displayInfo.name,
-                fontSize = 12.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = displayInfo.name,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
+                    modifier = Modifier.weight(1f)
+                )
+                if (displayInfo.desktopMode) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "桌面模式",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f), RoundedCornerShape(5.dp))
+                            .padding(horizontal = 5.dp, vertical = 2.dp)
+                    )
+                }
+            }
             val w = displayInfo.width
             val h = displayInfo.height
             Text(

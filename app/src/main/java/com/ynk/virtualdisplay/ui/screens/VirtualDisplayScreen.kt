@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Computer
 import androidx.compose.ui.window.Dialog
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -41,6 +42,7 @@ import com.ynk.virtualdisplay.ui.main.MainIntent
 import com.ynk.virtualdisplay.ui.main.MainViewModel
 import com.ynk.virtualdisplay.ui.components.DisplayItem
 import com.ynk.virtualdisplay.ui.components.AppSelectionDialog
+import kotlinx.coroutines.launch
 
 private data class DisplayPreset(val name: String, val width: Int, val height: Int, val dpi: Int)
 
@@ -58,6 +60,8 @@ fun VirtualDisplayScreen(
     var showAppSelectionDialogForDisplayId by remember { mutableStateOf<Int?>(null) }
     var showCreateDialog by remember { mutableStateOf(false) }
     var showErrorDialog by remember { mutableStateOf(false) }
+    var creatingDesktopMode by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     val gridState = rememberLazyGridState()
     val isFabExpanded by remember {
@@ -141,6 +145,49 @@ fun VirtualDisplayScreen(
                             )
                         }
                     }
+                    Button(
+                        onClick = {
+                            if (creatingDesktopMode) return@Button
+                            creatingDesktopMode = true
+                            scope.launch {
+                                viewModel.createDesktopDisplay()
+                                    .onSuccess { displayId ->
+                                        context.startActivity(
+                                            DisplayActivity.createIntent(
+                                                context,
+                                                displayId,
+                                                uiState.currentServerNode.uniqueKey(),
+                                                desktopMode = true
+                                            )
+                                        )
+                                    }
+                                    .onFailure { e ->
+                                        Toast.makeText(
+                                            context,
+                                            "桌面模式创建失败: ${e.message}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                creatingDesktopMode = false
+                            }
+                        },
+                        enabled = !creatingDesktopMode && uiState.connectionStatus == ConnectionStatus.CONNECTED,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.height(36.dp),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        if (creatingDesktopMode) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(Icons.Default.Computer, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("桌面模式", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
                     IconButton(
                         onClick = { viewModel.handleIntent(MainIntent.RefreshDisplays) },
                         modifier = Modifier
@@ -384,8 +431,9 @@ fun VirtualDisplayScreen(
                             onPlay = {
                                 val intent = DisplayActivity.createIntent(
                                     context, 
-                                    displayInfo.id, 
-                                    uiState.currentServerNode.uniqueKey()
+                                    displayInfo.id,
+                                    uiState.currentServerNode.uniqueKey(),
+                                    desktopMode = displayInfo.desktopMode
                                 )
                                 context.startActivity(intent)
                             },

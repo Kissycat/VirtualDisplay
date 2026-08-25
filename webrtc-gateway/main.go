@@ -39,62 +39,63 @@ body{display:flex;flex-direction:column}
 #bar{height:38px;display:flex;align-items:center;gap:12px;padding:0 12px;background:#202020;box-sizing:border-box;font-size:13px}
 #status{color:#9ad}
 button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:5px 10px;cursor:pointer}
-#wrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
+#wrap{position:relative;flex:1;display:flex;align-items:center;justify-content:center;min-height:0;overflow:hidden}
 video{max-width:100%;max-height:100%;width:auto;height:auto;background:#000;object-fit:contain}
+#cursor{position:absolute;width:0;height:0;pointer-events:none;z-index:20;display:none;filter:drop-shadow(0 1px 1px rgba(0,0,0,.9))}
+#cursor::before{content:"";position:absolute;left:0;top:0;width:0;height:0;border-top:15px solid #fff;border-right:8px solid transparent;transform:rotate(-8deg)}
+#cursor::after{content:"";position:absolute;left:2px;top:3px;width:0;height:0;border-top:10px solid #111;border-right:5px solid transparent;transform:rotate(-8deg)}
 </style>
 </head>
 <body>
 <div id="bar"><span>VirtualDisplay WebRTC</span><span id="status">connecting...</span><button id="reconnect">Reconnect</button></div>
-<div id="wrap"><video id="video" autoplay playsinline muted></video></div>
+<div id="wrap"><video id="video" autoplay playsinline muted></video><div id="cursor"></div></div>
 <script>
 const video=document.getElementById('video');
+const wrap=document.getElementById('wrap');
+const cursor=document.getElementById('cursor');
 const status=document.getElementById('status');
 let pc=null;
-
 function setStatus(s){ status.textContent=s; console.log('[WebRTC]',s); }
-
+function updateCursor(c){
+  if(!c || !c.visible || !c.width || !c.height || !video.videoWidth || !video.videoHeight){cursor.style.display='none';return;}
+  const vr=video.getBoundingClientRect();
+  const wr=wrap.getBoundingClientRect();
+  if(vr.width<=0 || vr.height<=0){cursor.style.display='none';return;}
+  // c.x/c.y are in the 1920x1080 virtual display. Map them to the actual
+  // displayed video rectangle, including object-fit/letterboxing.
+  const px=vr.left-wr.left+(c.x/c.width)*vr.width;
+  const py=vr.top-wr.top+(c.y/c.height)*vr.height;
+  cursor.style.left=px+'px';
+  cursor.style.top=py+'px';
+  cursor.style.display='block';
+}
+async function pollCursor(){
+  try{const r=await fetch('/cursor',{cache:'no-store'});if(r.ok)updateCursor(await r.json());}
+  catch(e){}
+  requestAnimationFrame(()=>setTimeout(pollCursor,33));
+}
 async function start(){
-  if(pc){ try{pc.close()}catch(e){} pc=null; }
+  if(pc){try{pc.close()}catch(e){}pc=null;}
   setStatus('creating peer...');
   pc=new RTCPeerConnection({iceServers:[]});
   pc.addTransceiver('video',{direction:'recvonly'});
-  pc.ontrack=e=>{
-    console.log('[WebRTC] track',e.track.kind,e.streams.length);
-    if(e.streams && e.streams[0]) video.srcObject=e.streams[0];
-    else video.srcObject=new MediaStream([e.track]);
-    video.play().catch(err=>console.warn('video.play:',err));
-  };
+  pc.ontrack=e=>{video.srcObject=(e.streams&&e.streams[0])?e.streams[0]:new MediaStream([e.track]);video.play().catch(()=>{});};
   pc.oniceconnectionstatechange=()=>setStatus('ICE: '+pc.iceConnectionState);
   pc.onconnectionstatechange=()=>setStatus('PC: '+pc.connectionState);
-  pc.onicecandidate=e=>{ if(e.candidate) console.log('[WebRTC] ICE candidate',e.candidate.candidate); };
   try{
     const offer=await pc.createOffer({offerToReceiveVideo:true});
     await pc.setLocalDescription(offer);
-    setStatus('waiting for ICE...');
-    await new Promise(resolve=>{
-      if(pc.iceGatheringState==='complete') return resolve();
-      const timer=setTimeout(resolve,5000);
-      pc.onicegatheringstatechange=()=>{
-        if(pc.iceGatheringState==='complete'){clearTimeout(timer);resolve();}
-      };
-    });
-    const local=pc.localDescription;
-    console.log('[WebRTC] sending offer',local.sdp);
-    const res=await fetch('/offer',{method:'POST',headers:{'Content-Type':'application/sdp'},body:local.sdp});
-    if(!res.ok) throw new Error('HTTP '+res.status+' '+await res.text());
-    const answer=await res.text();
-    console.log('[WebRTC] answer',answer);
-    await pc.setRemoteDescription({type:'answer',sdp:answer});
-    setStatus('answer applied');
-  }catch(e){
-    console.error('[WebRTC] failed',e);
-    setStatus('error: '+e.message);
-    if(pc){try{pc.close()}catch(_){} pc=null;}
-  }
+    await new Promise(resolve=>{if(pc.iceGatheringState==='complete')return resolve();const timer=setTimeout(resolve,5000);pc.onicegatheringstatechange=()=>{if(pc.iceGatheringState==='complete'){clearTimeout(timer);resolve();}}});
+    const res=await fetch('/offer',{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
+    if(!res.ok)throw new Error('HTTP '+res.status+' '+await res.text());
+    await pc.setRemoteDescription({type:'answer',sdp:await res.text()});
+    setStatus('connected');
+  }catch(e){console.error('[WebRTC]',e);setStatus('error: '+e.message);if(pc){try{pc.close()}catch(_){}pc=null;}}
 }
-
+window.addEventListener('resize',()=>{fetch('/cursor',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(updateCursor).catch(()=>{});});
 document.getElementById('reconnect').onclick=start;
 start();
+pollCursor();
 </script>
 </body>
 </html>`
@@ -109,6 +110,7 @@ type h264Frame struct {
 
 type h264Source struct {
 	addr           string
+	controlAddr    string
 	mu             sync.RWMutex
 	header         streamHeader
 	config         []byte
@@ -137,17 +139,21 @@ type h264Source struct {
 	keyFramesSent  uint64
 	configSent     uint64
 	waitedNoConfig uint64
+	cursor         cursorState
 }
 
 func main() {
 	android := getenv("ANDROID_H264", "127.0.0.1:18080")
+	control := getenv("ANDROID_CONTROL", "127.0.0.1:18081")
 	listen := getenv("LISTEN", ":19000")
 
-	h264 := newH264Source(android)
+	h264 := newH264Source(android, control)
 	go h264.run()
+	go h264.pollCursor()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) { handleOffer(h264, w, r) })
+	mux.HandleFunc("/cursor", func(w http.ResponseWriter, r *http.Request) { handleCursor(h264, w, r) })
 	mux.HandleFunc("/debug/status", func(w http.ResponseWriter, r *http.Request) { handleDebugStatus(h264, w, r) })
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -189,6 +195,26 @@ type debugStatus struct {
 	WebRTC struct {
 		Note string `json:"note"`
 	} `json:"webrtc"`
+}
+
+func handleCursor(src *h264Source, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	src.mu.RLock()
+	c := src.cursor
+	src.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(c)
+}
+
+type cursorState struct {
+	Visible bool `json:"visible"`
+	X       int  `json:"x"`
+	Y       int  `json:"y"`
+	Width   int  `json:"width"`
+	Height  int  `json:"height"`
 }
 
 func handleDebugStatus(src *h264Source, w http.ResponseWriter, r *http.Request) {
@@ -362,8 +388,30 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, local.SDP)
 }
 
-func newH264Source(addr string) *h264Source {
-	return &h264Source{addr: addr, changed: make(chan struct{})}
+func newH264Source(addr, controlAddr string) *h264Source {
+	return &h264Source{addr: addr, controlAddr: controlAddr, changed: make(chan struct{})}
+}
+
+func (s *h264Source) pollCursor() {
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	url := "http://" + s.controlAddr + "/api/webrtc/cursor"
+	ticker := time.NewTicker(33 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		resp, err := client.Get(url)
+		if err != nil {
+			continue
+		}
+		var c cursorState
+		err = json.NewDecoder(resp.Body).Decode(&c)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		s.mu.Lock()
+		s.cursor = c
+		s.mu.Unlock()
+	}
 }
 
 func (s *h264Source) run() {

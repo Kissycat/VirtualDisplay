@@ -3,6 +3,7 @@ package com.ynk.virtualdisplay.net
 import android.util.Log
 import com.ynk.virtualdisplay.data.repository.IDisplayRepository
 import com.ynk.virtualdisplay.video.output.WebRtcH264OutputStatus
+import com.ynk.virtualdisplay.ui.display.DesktopCursorState
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -95,6 +96,7 @@ class WebRtcControlHttpServer(
                 when {
                     method == "OPTIONS" -> writeResponse(output, 204, "text/plain", "")
                     method == "GET" && path == "/api/webrtc/status" -> handleStatus(output)
+                    method == "GET" && path == "/api/webrtc/cursor" -> handleCursor(output)
                     method == "POST" && path == "/api/webrtc/start" -> handleStart(output, body)
                     method == "POST" && path == "/api/webrtc/stop" -> handleStop(output)
                     method == "GET" && path == "/webrtc" -> handleBrowserPage(output)
@@ -200,6 +202,10 @@ class WebRtcControlHttpServer(
             </script></body></html>
         """.trimIndent()
         writeResponse(output, 200, "text/html; charset=utf-8", html)
+    }
+
+    private fun handleCursor(output: BufferedOutputStream) {
+        writeResponse(output, 200, "application/json; charset=utf-8", DesktopCursorState.json())
     }
 
     private fun currentStatus(): WebRtcH264OutputStatus = repositoryProvider()?.let { repo ->

@@ -20,6 +20,7 @@ object ScrcpyControlEncoder {
     private const val TYPE_INJECT_KEYCODE = 0
     private const val TYPE_INJECT_TOUCH_EVENT = 2
     private const val TYPE_INJECT_SCROLL_EVENT = 3
+    private const val TYPE_INJECT_MOUSE_EVENT = 23
 
     private const val POINTER_ID_MOUSE = -1L
 
@@ -77,7 +78,7 @@ object ScrcpyControlEncoder {
     }
 
     /**
-     * Encode all pointers in a [MotionEvent] as individual TYPE_INJECT_TOUCH_EVENT
+     * Encode ordinary touchscreen pointers as TYPE_INJECT_TOUCH_EVENT.
      * messages and write to [out].
      *
      * Each pointer in the event is sent as a separate scrcpy message. The server's
@@ -146,6 +147,36 @@ object ScrcpyControlEncoder {
             }
             out.writeInt(buttons)
         }
+    }
+
+    /**
+     * Encode a dedicated desktop mouse event. The server treats this message
+     * as SOURCE_MOUSE unconditionally; it is never eligible for touchscreen
+     * interpretation.
+     */
+    fun encodeMouseEvent(
+        out: DataOutputStream,
+        event: MotionEvent,
+        screenWidth: Int,
+        screenHeight: Int,
+    ) {
+        val action = event.actionMasked
+        val index = event.actionIndex.coerceIn(0, (event.pointerCount - 1).coerceAtLeast(0))
+        val pointerId = if (event.pointerCount > 0) event.getPointerId(index).toLong() else POINTER_ID_MOUSE
+        val x = if (event.pointerCount > 0) event.getX(index).toInt() else 0
+        val y = if (event.pointerCount > 0) event.getY(index).toInt() else 0
+        val pressure = if (event.pointerCount > 0) event.getPressure(index) else 0f
+
+        out.writeByte(TYPE_INJECT_MOUSE_EVENT)
+        out.writeByte(action)
+        out.writeLong(pointerId)
+        out.writeInt(x)
+        out.writeInt(y)
+        out.writeShort(screenWidth and 0xFFFF)
+        out.writeShort(screenHeight and 0xFFFF)
+        out.writeShort(floatToU16FixedPoint(pressure.coerceIn(0f, 1f)).toInt())
+        out.writeInt(event.actionButton)
+        out.writeInt(event.buttonState)
     }
 
     /**

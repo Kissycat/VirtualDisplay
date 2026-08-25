@@ -13,7 +13,8 @@ data class DisplayInfoModel(
     val width: Int,
     val height: Int,
     val dpi: Int,
-    val mirrorDisplayId: Int = -1
+    val mirrorDisplayId: Int = -1,
+    val desktopMode: Boolean = false
 )
 
 enum class ScreenTab {

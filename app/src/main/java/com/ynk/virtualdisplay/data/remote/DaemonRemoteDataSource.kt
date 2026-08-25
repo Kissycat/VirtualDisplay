@@ -36,8 +36,8 @@ class DaemonRemoteDataSource(
 
     // === 应用启动 ===
 
-    suspend fun startActivity(packageName: String, displayId: Int): Result<Int> =
-        controlApi.startActivity(packageName, displayId)
+    suspend fun startActivity(packageName: String, displayId: Int, freeform: Boolean = false): Result<Int> =
+        controlApi.startActivity(packageName, displayId, freeform)
 
     suspend fun launchHome(displayId: Int): Result<Int> =
         controlApi.launchHome(displayId)

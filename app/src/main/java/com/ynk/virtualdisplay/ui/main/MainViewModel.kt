@@ -7,6 +7,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ynk.virtualdisplay.data.AppSettings
 import com.ynk.virtualdisplay.data.model.ShizukuState
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_PUBLIC
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH
 import com.ynk.virtualdisplay.data.repository.ConnectionStatus
 import com.ynk.virtualdisplay.domain.DisplayInteractor
 import com.ynk.virtualdisplay.manager.DisplayMetricsManager
@@ -44,6 +49,9 @@ class MainViewModel(
 
     companion object {
         private const val TAG = "MainViewModel"
+        const val DESKTOP_WIDTH = 1920
+        const val DESKTOP_HEIGHT = 1080
+        const val DESKTOP_DPI = 160
     }
 
     private val appContext = context.applicationContext
@@ -259,7 +267,8 @@ class MainViewModel(
                     width = display.width,
                     height = display.height,
                     dpi = display.dpi,
-                    mirrorDisplayId = display.mirrorDisplayId
+                    mirrorDisplayId = display.mirrorDisplayId,
+                    desktopMode = display.desktopMode
                 )
             }
 
@@ -362,8 +371,9 @@ class MainViewModel(
 
     fun launchSelectedApp(packageName: String, displayId: Int) {
         viewModelScope.launch {
+            val desktopMode = _uiState.value.displays.firstOrNull { it.id == displayId }?.desktopMode == true
             _uiState.update { it.copy(isLoading = true, statusMessage = "Launching $packageName on $displayId...") }
-            interactor.launchApp(packageName, displayId)
+            interactor.launchApp(packageName, displayId, freeform = false)
                 .onSuccess {
                     _uiState.update { it.copy(isLoading = false, statusMessage = "Launched $packageName") }
                 }
@@ -371,6 +381,27 @@ class MainViewModel(
                     Log.e(TAG, "Failed to launch app", e)
                     _uiState.update { it.copy(isLoading = false, statusMessage = "Launch failed: ${e.message}") }
                 }
+        }
+    }
+
+    suspend fun createDesktopDisplay(): Result<Int> {
+        val desktopFlags =
+            VIRTUAL_DISPLAY_FLAG_PUBLIC or
+            VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
+            VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH or
+            VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS or
+            VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP
+
+        return interactor.createDisplay(
+            name = "Desktop 1080p",
+            width = DESKTOP_WIDTH,
+            height = DESKTOP_HEIGHT,
+            dpi = DESKTOP_DPI,
+            flags = desktopFlags,
+            desktopMode = true
+        ).onSuccess { displayId ->
+            interactor.launchHome(displayId)
+            refreshDisplays()
         }
     }
 

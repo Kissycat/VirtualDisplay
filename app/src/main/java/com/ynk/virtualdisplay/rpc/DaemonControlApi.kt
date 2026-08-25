@@ -1,6 +1,7 @@
 package com.ynk.virtualdisplay.rpc
 
 import android.util.Log
+import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -15,7 +16,7 @@ interface DaemonControlApi {
     suspend fun createDisplay(name: String, w: Int, h: Int, dpi: Int, flags: Int, mirrorDisplayId: Int = -1): Result<Int>
     suspend fun releaseDisplay(displayId: Int): Result<Unit>
     suspend fun resizeDisplay(displayId: Int, w: Int, h: Int, dpi: Int): Result<Unit>
-    suspend fun startActivity(packageName: String, displayId: Int): Result<Int>
+    suspend fun startActivity(packageName: String, displayId: Int, freeform: Boolean = false): Result<Int>
     suspend fun launchHome(displayId: Int): Result<Int>
     suspend fun listApps(): Result<List<DeviceMessage.AppEntry>>
     suspend fun getActiveDisplayIds(): Result<IntArray>
@@ -93,8 +94,8 @@ class DaemonControlApiImpl(
         }
     }
 
-    override suspend fun startActivity(packageName: String, displayId: Int): Result<Int> {
-        val msg = ControlMessage.StartActivity(packageName, displayId)
+    override suspend fun startActivity(packageName: String, displayId: Int, freeform: Boolean): Result<Int> {
+        val msg = ControlMessage.StartActivity(packageName, displayId, freeform)
         val resp = rpc.sendAndAwait(msg) ?: return Result.failure(IOException("Connection error or timeout"))
         return if (resp is DeviceMessage.GenericResponse) {
             if (resp.statusCode >= 0) {
@@ -186,8 +187,14 @@ class DaemonControlApiImpl(
                             }
                         }
                         else -> {
+                            val mouse = event.isFromSource(InputDevice.SOURCE_MOUSE) ||
+                                event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE
                             val ok = transport.writeControlMessage { stream ->
-                                ScrcpyControlEncoder.encodeTouchEvent(stream, event, screenWidth, screenHeight)
+                                if (mouse) {
+                                    ScrcpyControlEncoder.encodeMouseEvent(stream, event, screenWidth, screenHeight)
+                                } else {
+                                    ScrcpyControlEncoder.encodeTouchEvent(stream, event, screenWidth, screenHeight)
+                                }
                             }
                             if (!ok) {
                                 Log.e("DaemonControlApi", "injectInput: failed to write TOUCH to ROLE_CONTROL socket (displayId=$displayId)")

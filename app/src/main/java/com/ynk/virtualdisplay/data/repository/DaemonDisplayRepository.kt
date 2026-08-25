@@ -412,14 +412,14 @@ class DaemonDisplayRepository(
         }
     }
 
-    override suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int, mirrorDisplayId: Int): Result<Int> {
+    override suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int, mirrorDisplayId: Int, desktopMode: Boolean): Result<Int> {
         val finalFlags = if (flags != 0) flags else 0
         Log.d(TAG, "createDisplay: name=$name, width=$width, height=$height, dpi=$dpi, flags=0x${Integer.toHexString(finalFlags)}, mirrorDisplayId=$mirrorDisplayId")
         // 创建显示器 → Remote DataSource
         val result = remoteDataSource.createDisplay(name, width, height, dpi, finalFlags, mirrorDisplayId)
         result.onSuccess { displayId ->
             val currentNode = AppSettings.getCurrentServerNodeSync()
-            AppSettings.saveDisplayForServer(context, currentNode, SavedDisplay(displayId, name, width, height, dpi, mirrorDisplayId))
+            AppSettings.saveDisplayForServer(context, currentNode, SavedDisplay(displayId, name, width, height, dpi, mirrorDisplayId, desktopMode = desktopMode))
             refreshManagedDisplays()
         }
         return result
@@ -497,9 +497,9 @@ class DaemonDisplayRepository(
         return result
     }
 
-    override suspend fun launchApp(packageName: String, displayId: Int): Result<Int> {
+    override suspend fun launchApp(packageName: String, displayId: Int, freeform: Boolean): Result<Int> {
         // 启动应用 → Remote DataSource
-        val result = remoteDataSource.startActivity(packageName, displayId)
+        val result = remoteDataSource.startActivity(packageName, displayId, freeform)
         // 最近应用写入 → Local DataSource
         result.onSuccess { settingsDataSource.addRecentApp(packageName) }
         return result

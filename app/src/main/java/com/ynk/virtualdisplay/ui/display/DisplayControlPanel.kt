@@ -24,6 +24,7 @@ import com.ynk.virtualdisplay.R
 class DisplayControlPanel(
     context: Context,
     private val onBackClick: () -> Unit,
+    private val onDesktopHomeClick: () -> Unit,
     private val onAppLauncherClick: () -> Unit,
     private val onKeyboardClick: () -> Unit,
     private val onCloseClick: () -> Unit
@@ -150,13 +151,20 @@ class DisplayControlPanel(
         }
         buttonsContainer.addView(backButton)
 
-        // 3. 应用启动器按钮
+        // 3. 返回桌面：切回虚拟桌面 HOME，隐藏当前 Freeform Task
+        // 保留在控制栏中，避免必须重新创建虚拟显示器。
+        val desktopHomeButton = createControlButton(R.drawable.ic_home) {
+            onDesktopHomeClick()
+        }
+        buttonsContainer.addView(desktopHomeButton)
+
+        // 4. 应用启动器按钮
         val appButton = createControlButton(R.drawable.ic_apps) {
             onAppLauncherClick()
         }
         buttonsContainer.addView(appButton)
 
-        // 4.5 键盘开关按钮
+        // 5. 键盘开关按钮
         val keyboardButton = createControlButton(R.drawable.ic_keyboard) {
             onKeyboardClick()
         }

@@ -122,7 +122,8 @@ class DisplayInteractor(
         height: Int,
         dpi: Int,
         flags: Int = 0,
-        mirrorDisplayId: Int = -1
+        mirrorDisplayId: Int = -1,
+        desktopMode: Boolean = false
     ): Result<Int> {
         // 业务规则校验（尺寸/比例）失败必须转为 Result.failure，不能抛出：
         // 调用方 MainViewModel.createVirtualDisplay 在 viewModelScope.launch 中
@@ -135,7 +136,7 @@ class DisplayInteractor(
             return Result.failure(e)
         }
 
-        return repository.createDisplay(name, width, height, dpi, finalFlags, mirrorDisplayId)
+        return repository.createDisplay(name, width, height, dpi, finalFlags, mirrorDisplayId, desktopMode)
     }
 
     /**
@@ -162,8 +163,8 @@ class DisplayInteractor(
     /**
      * 在指定显示器上启动应用，并记录到最近使用列表。
      */
-    suspend fun launchApp(packageName: String, displayId: Int): Result<Int> {
-        return repository.launchApp(packageName, displayId)
+    suspend fun launchApp(packageName: String, displayId: Int, freeform: Boolean = false): Result<Int> {
+        return repository.launchApp(packageName, displayId, freeform)
     }
 
     /**

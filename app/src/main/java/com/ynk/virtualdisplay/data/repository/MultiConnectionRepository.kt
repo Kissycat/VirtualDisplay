@@ -115,8 +115,8 @@ class MultiConnectionRepository(
     }
     override fun refreshDisplays() { activeSlot?.refreshDisplays() }
 
-    override suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int, mirrorDisplayId: Int): Result<Int> =
-        activeSlot?.createDisplay(name, width, height, dpi, flags, mirrorDisplayId) ?: Result.failure(noActiveSlotError())
+    override suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int, mirrorDisplayId: Int, desktopMode: Boolean): Result<Int> =
+        activeSlot?.createDisplay(name, width, height, dpi, flags, mirrorDisplayId, desktopMode) ?: Result.failure(noActiveSlotError())
 
     override suspend fun releaseDisplay(displayId: Int): Result<Unit> =
         activeSlot?.releaseDisplay(displayId) ?: Result.failure(noActiveSlotError())
@@ -127,8 +127,8 @@ class MultiConnectionRepository(
     override suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit> =
         activeSlot?.resizeDisplay(displayId, width, height, dpi) ?: Result.failure(noActiveSlotError())
 
-    override suspend fun launchApp(packageName: String, displayId: Int): Result<Int> =
-        activeSlot?.launchApp(packageName, displayId) ?: Result.failure(noActiveSlotError())
+    override suspend fun launchApp(packageName: String, displayId: Int, freeform: Boolean): Result<Int> =
+        activeSlot?.launchApp(packageName, displayId, freeform) ?: Result.failure(noActiveSlotError())
 
     override suspend fun launchHome(displayId: Int): Result<Int> =
         activeSlot?.launchHome(displayId) ?: Result.failure(noActiveSlotError())

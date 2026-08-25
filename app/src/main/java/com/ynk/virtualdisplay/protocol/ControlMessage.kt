@@ -48,11 +48,17 @@ sealed class ControlMessage {
         }
     }
 
-    data class StartActivity(val packageName: String, val displayId: Int) : ControlMessage() {
+    data class StartActivity(
+        val packageName: String,
+        val displayId: Int,
+        val freeform: Boolean = false
+    ) : ControlMessage() {
         override val type: Int = TYPE_START_ACTIVITY
         override fun encode(sequence: Long): ByteArray = buildMessage(type, sequence) {
             writeString(packageName)
-            writeInt(displayId)
+            // Keep the wire format identical to legacy START_ACTIVITY: use the
+            // high bit of the displayId as the freeform launch marker.
+            writeInt(displayId or if (freeform) START_ACTIVITY_FLAG_FREEFORM_MASK else 0)
         }
     }
 
@@ -165,6 +171,7 @@ sealed class ControlMessage {
         const val TYPE_RELEASE_VIRTUAL_DISPLAY = 202
         const val TYPE_RESIZE_VIRTUAL_DISPLAY = 203
         const val TYPE_START_ACTIVITY = 204
+        const val START_ACTIVITY_FLAG_FREEFORM_MASK = Int.MIN_VALUE
         const val TYPE_GET_ACTIVE_DISPLAY_IDS = 205
         // 注意：TYPE_INJECT_INPUT_EVENT_WITH_DISPLAY_ID (206) 已从服务端移除
         // (commit b7aef962)。注入改为走 ROLE_CONTROL socket 上的 scrcpy 原生

@@ -56,3 +56,11 @@ After the app starts, the control API listens on `0.0.0.0:18081`. The H.264 brid
    `curl -X POST http://<android-ip>:18081/api/webrtc/stop`
 
 This path reuses the existing H.264 encoder. The Android side does not add a second video encoder.
+
+## 桌面模式
+
+控制台新增“桌面模式”，会创建一个独立的 `1920×1080 / 240 DPI` 横向虚拟显示器，并把从应用内启动的应用以 Android Freeform 窗口方式启动。
+
+桌面模式进入操控界面后仍保持原有 WebRTC/H.264 输出链路；当 WebRTC 输出状态变为运行时，本机不再继续渲染该虚拟屏幕画面，操控界面自动切换为触摸板：单指移动为鼠标移动，单指点击为左键，单指拖动为左键拖动，双指点击为右键，双指上下移动为滚轮。
+
+Freeform 使用 Android `ActivityOptions` 的隐藏 `setLaunchWindowingMode()` 能力并通过反射调用，因此最终行为仍取决于设备/ROM 是否允许 Freeform 窗口；不支持时会回退为普通窗口启动。

@@ -4,6 +4,7 @@
 
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <queries>
         <intent>
@@ -41,6 +42,32 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".ui.desktop.DesktopShellActivity"
+            android:exported="true"
+            android:label="Virtual Desktop"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:noHistory="false"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density"
+            android:theme="@style/Theme.MyApplication">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.desktop.FreeformChromeActivity"
+            android:exported="true"
+            android:label="Freeform Controls"
+            android:excludeFromRecents="true"
+            android:noHistory="false"
+            android:resizeableActivity="true"
+            android:theme="@style/Theme.MyApplication" />
 
         <activity
             android:name=".ui.display.DisplayActivity"

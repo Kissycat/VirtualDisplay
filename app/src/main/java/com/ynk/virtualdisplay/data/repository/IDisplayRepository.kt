@@ -57,7 +57,7 @@ interface IDisplayRepository {
     suspend fun stopDaemon(): Result<Unit>
 
     /** 创建虚拟显示器 */
-    suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int = 0, mirrorDisplayId: Int = -1): Result<Int>
+    suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int = 0, mirrorDisplayId: Int = -1, desktopMode: Boolean = false): Result<Int>
 
     /** 释放指定显示器 */
     suspend fun releaseDisplay(displayId: Int): Result<Unit>
@@ -69,7 +69,7 @@ interface IDisplayRepository {
     suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit>
 
     /** 在指定显示器启动应用 */
-    suspend fun launchApp(packageName: String, displayId: Int): Result<Int>
+    suspend fun launchApp(packageName: String, displayId: Int, freeform: Boolean = false): Result<Int>
 
     /** 在指定显示器启动主屏幕/Launcher */
     suspend fun launchHome(displayId: Int): Result<Int>
