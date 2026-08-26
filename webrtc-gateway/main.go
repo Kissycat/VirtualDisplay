@@ -26,6 +26,8 @@ const (
 	flagConfig                = 1
 	flagKeyFrame              = 2
 	defaultH264ProfileLevelID = "42e032" // Baseline, Level 5.0
+	frameHistoryWindow        = 4 * time.Second
+	frameHistoryMaxFrames     = 600
 )
 const browserHTML = `<!doctype html>
 <html lang="en">
@@ -102,10 +104,11 @@ pollCursor();
 
 type streamHeader struct{ Width, Height int }
 type h264Frame struct {
-	seq   uint64
-	ptsUs int64
-	flags int
-	data  []byte // normalized Annex-B access unit
+	seq        uint64
+	ptsUs      int64
+	flags      int
+	data       []byte // normalized Annex-B access unit
+	receivedAt time.Time
 }
 
 type h264Source struct {
@@ -119,27 +122,31 @@ type h264Source struct {
 	profileLevelID string
 	latest         *h264Frame
 	latestKey      *h264Frame
+	history        []*h264Frame
 	seq            uint64
 	changed        chan struct{}
 	keyRequest     uint64
 
 	// Diagnostics / stream state.
-	connected      bool
-	connectCount   uint64
-	frames         uint64
-	keyFrames      uint64
-	configFrames   uint64
-	bytes          uint64
-	lastFrameAt    time.Time
-	lastFrameSize  int
-	lastError      string
-	pliCount       uint64
-	lastPLIAt      time.Time
-	framesSent     uint64
-	keyFramesSent  uint64
-	configSent     uint64
-	waitedNoConfig uint64
-	cursor         cursorState
+	connected        bool
+	connectCount     uint64
+	frames           uint64
+	keyFrames        uint64
+	configFrames     uint64
+	bytes            uint64
+	lastFrameAt      time.Time
+	lastFrameSize    int
+	lastError        string
+	pliCount         uint64
+	lastPLIAt        time.Time
+	lastKeyRequestAt time.Time
+	framesSent       uint64
+	keyFramesSent    uint64
+	configSent       uint64
+	waitedNoConfig   uint64
+	frameOverruns    uint64
+	recoveryCount    uint64
+	cursor           cursorState
 }
 
 func main() {
@@ -191,6 +198,8 @@ type debugStatus struct {
 		KeyFramesSent  uint64 `json:"keyFramesSent"`
 		ConfigSent     uint64 `json:"configSent"`
 		WaitedNoConfig uint64 `json:"waitedNoConfig"`
+		FrameOverruns  uint64 `json:"frameOverruns"`
+		RecoveryCount  uint64 `json:"recoveryCount"`
 	} `json:"source"`
 	WebRTC struct {
 		Note string `json:"note"`
@@ -336,12 +345,22 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 				for _, pkt := range pkts {
 					switch pkt.(type) {
 					case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+						now := time.Now()
 						src.mu.Lock()
 						src.pliCount++
-						src.lastPLIAt = time.Now()
-						src.keyRequest++
+						src.lastPLIAt = now
+						// Repeated PLI/FIR packets can arrive every few milliseconds while the
+						// decoder is waiting. Do not turn that into an IDR storm; one recovery
+						// request per 500 ms is sufficient because the latest keyframe is cached.
+						request := src.lastKeyRequestAt.IsZero() || now.Sub(src.lastKeyRequestAt) >= 500*time.Millisecond
+						if request {
+							src.keyRequest++
+							src.lastKeyRequestAt = now
+						}
 						src.mu.Unlock()
-						log.Printf("[H264-RTCP] keyframe requested by browser (%T)", pkt)
+						if request {
+							log.Printf("[H264-RTCP] keyframe requested by browser (%T)", pkt)
+						}
 					case *rtcp.TransportLayerNack:
 						// No source-side packet loss exists because VDH1 is TCP.
 					}
@@ -535,8 +554,18 @@ func (s *h264Source) readOnce() error {
 
 			s.mu.Lock()
 			s.seq++
-			f := &h264Frame{seq: s.seq, ptsUs: pts, flags: flags, data: normalized}
+			now := time.Now()
+			f := &h264Frame{seq: s.seq, ptsUs: pts, flags: flags, data: normalized, receivedAt: now}
 			s.latest = f
+			s.history = append(s.history, f)
+			cutoff := now.Add(-frameHistoryWindow)
+			firstKeep := 0
+			for firstKeep < len(s.history) && (len(s.history)-firstKeep > frameHistoryMaxFrames || s.history[firstKeep].receivedAt.Before(cutoff)) {
+				firstKeep++
+			}
+			if firstKeep > 0 {
+				s.history = append([]*h264Frame(nil), s.history[firstKeep:]...)
+			}
 			s.frames++
 			s.bytes += uint64(len(normalized))
 			s.lastFrameAt = time.Now()
@@ -578,129 +607,195 @@ func (s *h264Source) waitProfile(timeout time.Duration) string {
 
 func (s *h264Source) pipeTo(track *webrtc.TrackLocalStaticSample, pc *webrtc.PeerConnection) {
 	var lastSeq uint64
-	var lastPtsUs int64
 	var ptsBaseUs int64 = -1
-	var seenKeyRequest uint64
+	var lastPtsUs int64 = -1
+	var forceKeySeen uint64
+	var pending *h264Frame
+	var pendingData []byte
+	var pendingKey bool
+	var pendingRelPtsUs int64
 	loggedFirst := false
+
+	// Small one-frame look-ahead: with VFR input, the duration of the current
+	// sample is the delta to the next sample, not the delta from the previous one.
+	// This keeps RTP pacing faithful to the real source cadence.
+	flushPending := func(nextPtsUs int64, hasNext bool) error {
+		if pending == nil {
+			return nil
+		}
+		dur := time.Second / 60
+		if hasNext && nextPtsUs >= pendingRelPtsUs {
+			d := time.Duration(nextPtsUs-pendingRelPtsUs) * time.Microsecond
+			if d >= 1*time.Millisecond && d <= 2*time.Second {
+				dur = d
+			}
+		}
+		if err := track.WriteSample(media.Sample{Data: pendingData, Duration: dur}); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.framesSent++
+		if pendingKey {
+			s.keyFramesSent++
+			s.configSent++
+		}
+		s.mu.Unlock()
+		if !loggedFirst {
+			s.mu.RLock()
+			profile := s.profileLevelID
+			s.mu.RUnlock()
+			log.Printf("WebRTC first H264 sample: seq=%d pts=%d key=%t size=%d duration=%s selfContained=%t profile-level-id=%s",
+				pending.seq, pending.ptsUs, pendingKey, len(pendingData), dur, containsSPSPPS(pendingData), profile)
+			loggedFirst = true
+		}
+		pending = nil
+		pendingData = nil
+		pendingKey = false
+		lastPtsUs = pendingRelPtsUs
+		return nil
+	}
 
 	for {
 		s.mu.RLock()
 		ch := s.changed
-		f := s.latest
+		latestSeq := s.seq
 		key := s.latestKey
 		cfg := append([]byte(nil), s.config...)
 		currentKeyRequest := s.keyRequest
+		var next *h264Frame
+		var overrun bool
+
+		if lastSeq == 0 {
+			next = key
+		} else {
+			target := lastSeq + 1
+			for _, candidate := range s.history {
+				if candidate.seq == target {
+					next = candidate
+					break
+				}
+			}
+			if next == nil && latestSeq >= target && len(s.history) > 0 && s.history[0].seq > target {
+				overrun = true
+			}
+		}
 		s.mu.RUnlock()
 
-		forceKey := currentKeyRequest != seenKeyRequest
+		forceKey := currentKeyRequest != forceKeySeen
 		if forceKey {
-			seenKeyRequest = currentKeyRequest
+			forceKeySeen = currentKeyRequest
+			// A browser PLI/FIR is an explicit decoder recovery request. Discard any
+			// pending P-frame and restart from the newest complete IDR.
+			pending = nil
+			pendingData = nil
+			pendingKey = false
 		}
 
-		if f == nil || (lastSeq == 0 && key == nil) {
+		if forceKey || overrun {
+			s.mu.RLock()
+			key = s.latestKey
+			cfg = append([]byte(nil), s.config...)
+			s.mu.RUnlock()
+			if key != nil && len(cfg) > 0 {
+				next = key
+				s.mu.Lock()
+				if overrun {
+					s.frameOverruns++
+				}
+				s.recoveryCount++
+				s.mu.Unlock()
+			}
+		}
+
+		if next == nil {
 			select {
 			case <-ch:
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(50 * time.Millisecond):
 			}
-			if pc.ConnectionState() == webrtc.PeerConnectionStateClosed ||
-				pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
+			if pc.ConnectionState() == webrtc.PeerConnectionStateClosed || pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
 				return
 			}
 			continue
 		}
 
-		if lastSeq == 0 {
-			// Never start a peer on a P-frame. Decoder configuration and IDR
-			// are both mandatory for the first sample.
-			if key == nil || len(cfg) == 0 {
+		// First media sample must be a self-contained IDR. Never start or recover
+		// a peer from a P-frame.
+		if lastSeq == 0 || forceKey || overrun {
+			if !((next.flags&flagKeyFrame) != 0 && len(cfg) > 0) {
 				s.mu.Lock()
 				s.waitedNoConfig++
 				s.mu.Unlock()
 				select {
 				case <-ch:
-				case <-time.After(100 * time.Millisecond):
+				case <-time.After(50 * time.Millisecond):
 				}
 				continue
 			}
-			f = key
-		} else if forceKey && key != nil {
-			f = key
-		} else if f.seq == lastSeq {
-			select {
-			case <-ch:
-			case <-time.After(100 * time.Millisecond):
-			}
+		}
+
+		// Configuration-only access units update the cached decoder state but are
+		// never sent as standalone media samples. Advance the sequence cursor so the
+		// next P-frame remains contiguous in the source stream.
+		if next.flags&flagConfig != 0 && next.flags&flagKeyFrame == 0 {
+			lastSeq = next.seq
 			continue
 		}
 
-		data := f.data
-		isKey := f.flags&flagKeyFrame != 0
-
-		// Every keyframe delivered to a peer is made self-contained:
-		// SPS + PPS + IDR. This also recovers after a decoder reset or PLI.
+		data := next.data
+		isKey := next.flags&flagKeyFrame != 0
 		if isKey && len(cfg) > 0 && !containsSPSPPS(data) {
 			merged := make([]byte, 0, len(cfg)+len(data))
 			merged = append(merged, cfg...)
 			merged = append(merged, data...)
 			data = merged
 		}
-
 		if isKey && !containsSPSPPS(data) {
 			s.mu.Lock()
 			s.waitedNoConfig++
 			s.mu.Unlock()
 			select {
 			case <-ch:
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(50 * time.Millisecond):
 			}
 			continue
 		}
 
 		if ptsBaseUs < 0 {
-			ptsBaseUs = f.ptsUs
+			ptsBaseUs = next.ptsUs
 		}
-		relativePtsUs := f.ptsUs - ptsBaseUs
-		if relativePtsUs < 0 {
-			relativePtsUs = 0
+		relPtsUs := next.ptsUs - ptsBaseUs
+		if relPtsUs < 0 || (lastPtsUs >= 0 && relPtsUs < lastPtsUs) {
+			// The source session changed its PTS timeline. Restart the local timeline
+			// without changing frame order.
+			ptsBaseUs = next.ptsUs
+			relPtsUs = 0
+			lastPtsUs = -1
+			pending = nil
+			pendingData = nil
+			pendingKey = false
 		}
 
-		dur := time.Second / 30
-		if lastSeq != 0 && relativePtsUs > lastPtsUs {
-			d := time.Duration(relativePtsUs-lastPtsUs) * time.Microsecond
-			if d >= time.Millisecond && d <= 500*time.Millisecond {
-				dur = d
+		// If this is not contiguous with the previous frame, do not send it. The
+		// next IDR is the only safe recovery point for a predictive H.264 stream.
+		if lastSeq != 0 && next.seq != lastSeq+1 && !isKey {
+			continue
+		}
+
+		if pending != nil {
+			if err := flushPending(relPtsUs, true); err != nil {
+				log.Printf("WebRTC WriteSample failed: %v", err)
+				_ = pc.Close()
+				return
 			}
 		}
-		lastPtsUs = relativePtsUs
 
-		if err := track.WriteSample(media.Sample{Data: data, Duration: dur}); err != nil {
-			log.Printf("WebRTC WriteSample failed: %v", err)
-			_ = pc.Close()
-			return
-		}
+		pending = next
+		pendingData = data
+		pendingKey = isKey
+		pendingRelPtsUs = relPtsUs
+		lastSeq = next.seq
 
-		s.mu.Lock()
-		s.framesSent++
-		if isKey {
-			s.keyFramesSent++
-			s.configSent++
-		}
-		s.mu.Unlock()
-
-		lastSeq = f.seq
-		if !loggedFirst {
-			s.mu.RLock()
-			profile := s.profileLevelID
-			s.mu.RUnlock()
-			log.Printf(
-				"WebRTC first H264 sample: seq=%d pts=%d key=%t size=%d duration=%s selfContained=%t profile-level-id=%s",
-				f.seq, f.ptsUs, isKey, len(data), dur, containsSPSPPS(data), profile,
-			)
-			loggedFirst = true
-		}
-
-		if pc.ConnectionState() == webrtc.PeerConnectionStateClosed ||
-			pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
+		if pc.ConnectionState() == webrtc.PeerConnectionStateClosed || pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
 			return
 		}
 	}

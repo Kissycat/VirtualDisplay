@@ -186,7 +186,7 @@ class InputController(
                                     x = trackpadCursorX,
                                     y = trackpadCursorY,
                                     hScroll = 0f,
-                                    vScroll = dy / 72f,
+                                    vScroll = dy / 144f,
                                     buttons = 0,
                                     displayId = displayId,
                                 )

@@ -29,8 +29,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * Frame flags: bit 0 = codec-config, bit 1 = key-frame.
  *
- * Backpressure is isolated per client. A slow client drops older frame packets and
- * never blocks the MediaCodec input thread.
+ * Backpressure is isolated per client. H.264 inter-frame packets are never
+ * skipped independently: if a client queue overflows, that client enters key-frame
+ * recovery mode and drops subsequent P-frames until the next complete IDR arrives.
+ * This preserves H.264 reference-frame continuity and avoids visual tearing.
  */
 class WebRtcH264TcpEndpoint(
     private val videoController: VideoStreamController,
@@ -46,9 +48,12 @@ class WebRtcH264TcpEndpoint(
         private const val VERSION = 1
         private const val TYPE_FORMAT = 1
         private const val TYPE_FRAME = 2
-        private const val DEFAULT_QUEUE_CAPACITY = 12
+        // Large enough to absorb short bitrate spikes without introducing a large
+        // standing latency. At 60 fps this is ~400 ms; at 120 fps ~200 ms.
+        private const val DEFAULT_QUEUE_CAPACITY = 24
         private const val SOCKET_BACKLOG = 8
         private const val ACCEPT_READ_TIMEOUT_MS = 1000
+        private const val SOCKET_SEND_BUFFER_BYTES = 1024 * 1024
     }
 
     private data class FramePacket(val bytes: ByteArray, val isConfig: Boolean = false, val isKeyFrame: Boolean = false)
@@ -65,6 +70,8 @@ class WebRtcH264TcpEndpoint(
         private val queue = LinkedBlockingDeque<FramePacket>(queueCapacity.coerceAtLeast(8))
         @Volatile private var pendingConfig: FramePacket? = initialConfig
         @Volatile private var pendingKey: FramePacket? = initialKey
+        @Volatile private var awaitingKeyFrame: Boolean = initialKey == null
+        @Volatile private var overflowRecoveryCount: Long = 0
 
         private val closed = AtomicBoolean(false)
         private val writer = Thread({ runWriter() }, "webrtc-h264-writer-${socket.port}")
@@ -72,7 +79,7 @@ class WebRtcH264TcpEndpoint(
         init {
             socket.tcpNoDelay = true
             socket.keepAlive = true
-            socket.sendBufferSize = 256 * 1024
+            socket.sendBufferSize = SOCKET_SEND_BUFFER_BYTES
         }
 
         fun start() {
@@ -82,18 +89,38 @@ class WebRtcH264TcpEndpoint(
         fun offer(packet: FramePacket, critical: Boolean) {
             if (closed.get()) return
 
-            if (critical) {
-                if (packet.isConfig) {
-                    pendingConfig = packet
-                } else if (packet.isKeyFrame) {
-                    pendingKey = packet
-                }
+            if (packet.isConfig) {
+                // A new CSD starts a new decoder configuration generation. Any queued
+                // P-frames belong to the previous generation and must not be sent after it.
+                pendingConfig = packet
+                pendingKey = null
+                queue.clear()
+                awaitingKeyFrame = true
+                return
+            }
+
+            if (packet.isKeyFrame) {
+                // The IDR is the safe recovery boundary. Drop all older queued P-frames
+                // so the stream resumes as CONFIG -> IDR -> contiguous P-frames.
+                queue.clear()
+                pendingKey = packet
+                awaitingKeyFrame = false
+                return
+            }
+
+            // Never skip an arbitrary P-frame. Once one P-frame has been dropped,
+            // all following P-frames are unsafe until a fresh IDR is available.
+            if (awaitingKeyFrame) {
                 return
             }
 
             if (!queue.offerLast(packet)) {
-                queue.pollFirst()
-                queue.offerLast(packet)
+                queue.clear()
+                awaitingKeyFrame = true
+                overflowRecoveryCount++
+                if (overflowRecoveryCount <= 5 || overflowRecoveryCount % 50L == 0L) {
+                    Log.w(TAG, "H.264 client queue overflow; entering IDR recovery #$overflowRecoveryCount")
+                }
             }
         }
 
@@ -103,13 +130,14 @@ class WebRtcH264TcpEndpoint(
             // from the previous resolution before the new format metadata.
             pendingConfig = null
             pendingKey = null
+            awaitingKeyFrame = true
+            queue.clear()
             val out = java.io.ByteArrayOutputStream(9)
             DataOutputStream(out).use { data ->
                 data.writeByte(TYPE_FORMAT)
                 data.writeInt(width)
                 data.writeInt(height)
             }
-            queue.clear()
             queue.offerLast(FramePacket(out.toByteArray()))
         }
 
