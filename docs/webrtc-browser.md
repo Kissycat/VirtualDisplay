@@ -37,3 +37,7 @@ Android 负责 MediaCodec/H.264 和控制；Gateway 负责 H.264 RTP/WebRTC、SD
 `?gateway=http://<gateway-host>:19000`
 
 > 直接访问 Android `http://<android-ip>:18080` 不能播放，因为 18080 是 VDH1 原始 H.264 传输协议，不是 HTTP/WebRTC。
+
+## Embedded gateway (Desktop mode)
+
+Desktop mode exposes a WebRTC button in the floating dock. Clicking it automatically starts the H.264 endpoint for the current display and launches the bundled Go gateway through Shizuku/root from `/data/local/tmp`. No POST to `/api/webrtc/start` is required. The gateway listens on port 19000 by default.

@@ -22,7 +22,7 @@ class VideoStreamController(
         private const val TAG = "VideoStreamController"
         private const val DEFAULT_WIDTH = 1920
         private const val DEFAULT_HEIGHT = 1080
-        private const val PING_INTERVAL_MS = 1000L
+        private const val PING_INTERVAL_MS = 2000L
     }
 
     private val mutex = Mutex()

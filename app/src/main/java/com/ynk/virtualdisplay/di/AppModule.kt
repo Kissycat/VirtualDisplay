@@ -17,6 +17,7 @@ import com.ynk.virtualdisplay.rpc.DaemonRpc
 import com.ynk.virtualdisplay.ui.main.MainViewModel
 import com.ynk.virtualdisplay.util.ExceptionUtils
 import com.ynk.virtualdisplay.video.VideoStreamController
+import com.ynk.virtualdisplay.webrtc.GatewayProcessController
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -39,6 +40,7 @@ import org.koin.dsl.module
 val appModule = module {
     // === 核心基础设施层 ===
     single { DaemonProcessController(androidContext()) }
+    single { GatewayProcessController(androidContext()) }
     single { DaemonTransport() }
     single { DaemonRpc(get()) }
     // 先注册实现类，再分别绑定两个接口（都指向同一个单例实例）

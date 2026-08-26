@@ -38,6 +38,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import org.koin.android.ext.android.inject
+import com.ynk.virtualdisplay.webrtc.GatewayProcessController
 
 @SuppressLint("ClickableViewAccessibility", "UseKtx")
 class DisplayActivity : ComponentActivity() {
@@ -87,6 +88,7 @@ class DisplayActivity : ComponentActivity() {
 
     private val interactor: com.ynk.virtualdisplay.domain.DisplayInteractor by inject()
     private val displayMetricsManager: DisplayMetricsManager by inject()
+    private val gatewayProcessController: GatewayProcessController by inject()
     
     private val repository: IDisplayRepository by lazy {
         val key = nodeKey
@@ -172,9 +174,7 @@ class DisplayActivity : ComponentActivity() {
         }
         updateDisplayInfo(displayId)
         startDisconnectDetection(displayId)
-        if (desktopMode) {
-            startDesktopWebRtcMonitor()
-        }
+        startWebRtcMonitor()
 
         repository.setPerformanceStatsCallback { stats ->
             lifecycleScope.launch(Dispatchers.Main) {
@@ -192,6 +192,8 @@ class DisplayActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        desktopWebRtcMonitorJob?.cancel()
+        runCatching { gatewayProcessController.stop() }
         super.onDestroy()
         backCallback.remove()
         repository.setPerformanceStatsCallback(null)
@@ -318,6 +320,7 @@ class DisplayActivity : ComponentActivity() {
             },
             onAppLauncherClick = { showAppSelectionDialog() },
             onKeyboardClick = { toggleKeyboard() },
+            onWebRtcClick = { toggleWebRtc() },
             onCloseClick = { finish() },
         )
         rootLayout.addView(controlPanel)
@@ -342,47 +345,47 @@ class DisplayActivity : ComponentActivity() {
         setContentView(rootLayout)
     }
 
-    private fun startDesktopWebRtcMonitor() {
+    private fun startWebRtcMonitor() {
         desktopWebRtcMonitorJob?.cancel()
         desktopWebRtcMonitorJob = lifecycleScope.launch {
             while (!isFinishing && !isDestroyed) {
                 val running = repository.getWebRtcH264OutputStatus().running
                 if (running != desktopWebRtcRunning) {
                     desktopWebRtcRunning = running
-                    updateDesktopWebRtcUi(running)
+                    updateWebRtcUi(running)
                 }
                 kotlinx.coroutines.delay(300)
             }
         }
     }
 
-    private fun updateDesktopWebRtcUi(running: Boolean) {
-        if (!desktopMode) return
-
+    private fun updateWebRtcUi(running: Boolean) {
         if (running) {
-            // WebRTC mode turns the phone surface into a pure mouse/trackpad.
-            // Cancel any touch gesture which may have started before WebRTC
-            // became active, otherwise the old touchscreen stream can continue
-            // scrolling/clicking the remote app while the mouse is also moving.
-            inputController.cancelActiveTouch()
-            inputController.setTrackpadModeEnabled(true)
+            // Once H.264/WebRTC output is actually running, the phone-side video
+            // surface must be removed from the UI. The remote browser owns the
+            // display image now. Desktop mode additionally switches the same
+            // surface into the mouse/trackpad interaction model.
+            if (desktopMode) {
+                inputController.cancelActiveTouch()
+                inputController.setTrackpadModeEnabled(true)
+                DesktopCursorState.reset(1920, 1080)
+                rootLayout.setBackgroundColor(Color.rgb(28, 28, 28))
+            } else {
+                inputController.setTrackpadModeEnabled(false)
+                inputController.cancelActiveTouch()
+                rootLayout.setBackgroundColor(Color.BLACK)
+            }
 
-            // Stop local decode/rendering as soon as the H.264/WebRTC output is
-            // active. The display activity becomes a low-latency touchpad.
             if (::videoSurfaceView.isInitialized) {
                 videoSurfaceView.visibility = View.INVISIBLE
             }
-            // Keep the existing floating control panel: back/app/keyboard/close
-            // controls are still needed while the phone is used as a trackpad.
             if (::controlPanel.isInitialized) {
                 controlPanel.visibility = View.VISIBLE
             }
             if (::statsOverlay.isInitialized) {
                 statsOverlay.visibility = View.GONE
             }
-            DesktopCursorState.reset(1920, 1080)
-            rootLayout.setBackgroundColor(Color.rgb(28, 28, 28))
-            Log.i(TAG, "Desktop mode: WebRTC is running, local video hidden; mouse/trackpad-only input enabled")
+            Log.i(TAG, "WebRTC is running: local video hidden, desktopMode=$desktopMode")
         } else {
             inputController.setTrackpadModeEnabled(false)
             inputController.cancelActiveTouch()
@@ -392,8 +395,59 @@ class DisplayActivity : ComponentActivity() {
             if (::controlPanel.isInitialized) {
                 controlPanel.visibility = View.VISIBLE
             }
-            rootLayout.setBackgroundColor(Color.BLACK)
-            Log.i(TAG, "Desktop mode: WebRTC stopped, local video restored")
+            rootLayout.setBackgroundColor(if (desktopMode) Color.BLACK else Color.TRANSPARENT)
+            Log.i(TAG, "WebRTC stopped: local video restored, desktopMode=$desktopMode")
+        }
+    }
+
+    private fun toggleWebRtc() {
+        val displayId = remoteDisplayId
+        if (displayId == null || displayId < 0) {
+            android.widget.Toast.makeText(this, "无有效虚拟屏幕", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        lifecycleScope.launch(Dispatchers.IO) {
+            if (repository.getWebRtcH264OutputStatus().running) {
+                runCatching { gatewayProcessController.stop() }
+                repository.stopWebRtcH264Output()
+                runOnUiThread { android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 已停止", android.widget.Toast.LENGTH_SHORT).show() }
+                return@launch
+            }
+
+            // 关键顺序：先在 APK 内直接创建当前 Display 的 H.264 输出端口，
+            // 再启动独立 Gateway 去消费该端口。HTTP /api/webrtc/start 仅保留给外部调试。
+            val h264Result = repository.startWebRtcH264Output(
+                displayId = displayId,
+                bindHost = "127.0.0.1",
+                port = GatewayProcessController.DEFAULT_H264_PORT
+            )
+            if (h264Result.isFailure) {
+                val error = h264Result.exceptionOrNull() ?: IllegalStateException("H.264 输出启动失败")
+                Log.e(TAG, "Failed to start H264 output", error)
+                runOnUiThread {
+                    android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 启动失败: ${error.message}", android.widget.Toast.LENGTH_LONG).show()
+                }
+                return@launch
+            }
+
+            val result = gatewayProcessController.start(
+                displayId = displayId,
+                h264Port = GatewayProcessController.DEFAULT_H264_PORT,
+                gatewayPort = GatewayProcessController.DEFAULT_GATEWAY_PORT,
+                bindHost = "0.0.0.0"
+            )
+            result.onSuccess { url ->
+                runOnUiThread {
+                    android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 已启动: $url", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }.onFailure { error ->
+                // Gateway 启动失败时回滚 H.264 endpoint，避免本机画面被误判为正在 WebRTC。
+                repository.stopWebRtcH264Output()
+                Log.e(TAG, "Failed to start WebRTC gateway", error)
+                runOnUiThread {
+                    android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 启动失败: ${error.message}", android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
