@@ -21,6 +21,7 @@ object ScrcpyControlEncoder {
     private const val TYPE_INJECT_TOUCH_EVENT = 2
     private const val TYPE_INJECT_SCROLL_EVENT = 3
     private const val TYPE_INJECT_MOUSE_EVENT = 23
+    private const val TYPE_CONTROL_HEARTBEAT = 24
 
     private const val POINTER_ID_MOUSE = -1L
 
@@ -40,6 +41,11 @@ object ScrcpyControlEncoder {
         out.writeInt(event.keyCode)
         out.writeInt(event.repeatCount)
         out.writeInt(event.metaState)
+    }
+
+    /** Write a one-byte control-channel heartbeat. The server consumes it as a no-op. */
+    fun encodeControlHeartbeat(out: DataOutputStream) {
+        out.writeByte(TYPE_CONTROL_HEARTBEAT)
     }
 
     /**

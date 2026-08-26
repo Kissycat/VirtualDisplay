@@ -22,7 +22,7 @@ class VideoStreamController(
         private const val TAG = "VideoStreamController"
         private const val DEFAULT_WIDTH = 1920
         private const val DEFAULT_HEIGHT = 1080
-        private const val PING_INTERVAL_MS = 2000L
+        private const val PING_INTERVAL_MS = 1000L
     }
 
     private val mutex = Mutex()
@@ -148,6 +148,10 @@ class VideoStreamController(
                 val result = controlApi.ping()
                 result.onSuccess { rtt ->
                     tracker?.recordRtt(rtt.toDouble())
+                }
+                val controlOk = transport.writeControlHeartbeat()
+                if (!controlOk) {
+                    Log.w(TAG, "ROLE_CONTROL heartbeat/reconnect failed; input may be temporarily unavailable")
                 }
                 kotlinx.coroutines.delay(PING_INTERVAL_MS)
             }

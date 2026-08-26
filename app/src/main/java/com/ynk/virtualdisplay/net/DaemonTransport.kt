@@ -46,6 +46,8 @@ class DaemonTransport {
     @Volatile private var port: Int = 0
     // daemon_secret_token 认证。null 表示不发送认证。
     @Volatile private var secretToken: String? = null
+    @Volatile private var controlDisplayId: Int = -1
+    private val controlReconnectLock = Any()
 
     @Volatile
     var session: DaemonSession? = null
@@ -67,16 +69,39 @@ class DaemonTransport {
      * Returns false if the control socket is not connected (video not streaming).
      */
     fun writeControlMessage(block: (DataOutputStream) -> Unit): Boolean {
-        val out = controlOut ?: return false
         synchronized(controlWriteLock) {
+            var out = controlOut
+            if (out == null) {
+                out = reconnectControlChannelLocked() ?: return false
+            }
             try {
                 block(out)
                 out.flush()
-            } catch (_: IOException) {
-                return false
+                return true
+            } catch (e: IOException) {
+                Log.w(TAG, "ROLE_CONTROL write failed; reconnecting control channel", e)
+                closeControlChannelLocked()
+                out = reconnectControlChannelLocked() ?: return false
+                return try {
+                    block(out)
+                    out.flush()
+                    true
+                } catch (retry: IOException) {
+                    Log.e(TAG, "ROLE_CONTROL retry write failed", retry)
+                    closeControlChannelLocked()
+                    false
+                }
             }
         }
-        return true
+    }
+
+    /**
+     * Proactively verifies the ROLE_CONTROL channel. If it was closed by the
+     * daemon/network, writeControlMessage() will reconnect only the control
+     * socket; the video socket is left untouched.
+     */
+    fun writeControlHeartbeat(): Boolean = writeControlMessage { out ->
+        com.ynk.virtualdisplay.protocol.ScrcpyControlEncoder.encodeControlHeartbeat(out)
     }
 
     /**
@@ -93,6 +118,7 @@ class DaemonTransport {
             ctrl.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
             // Disable timeout for role sockets to prevent Controller thread from dying on idle
             ctrl.soTimeout = 0
+            ctrl.keepAlive = true
             controlSocket = ctrl
 
             val ctrlOut = ctrl.getOutputStream()
@@ -106,6 +132,7 @@ class DaemonTransport {
 
             controlIn = DataInputStream(ctrl.inputStream)
             controlOut = DataOutputStream(ctrlOut)
+            controlDisplayId = displayId
             Log.i(TAG, "Scrcpy control channel connected (session ${currentSession.sessionId}, displayId=$displayId, ack=$ctrlAck)")
 
             val video = Socket()
@@ -131,6 +158,50 @@ class DaemonTransport {
         }
     }
 
+    private fun closeControlChannelLocked() {
+        runCatching { controlIn?.close() }
+        runCatching { controlOut?.close() }
+        runCatching { controlSocket?.close() }
+        controlIn = null
+        controlOut = null
+        controlSocket = null
+    }
+
+    private fun reconnectControlChannelLocked(): DataOutputStream? {
+        val currentSession = session ?: return null
+        val displayId = controlDisplayId
+        if (displayId < 0 || host.isEmpty() || port <= 0) return null
+        synchronized(controlReconnectLock) {
+            if (controlOut != null) return controlOut
+            repeat(2) { attempt ->
+                try {
+                    val ctrl = Socket()
+                    ctrl.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+                    ctrl.soTimeout = 0
+                    ctrl.keepAlive = true
+                    val ctrlOut = ctrl.getOutputStream()
+                    DaemonHandshake.writeRole(ctrlOut, DaemonSocketRole.ROLE_CONTROL)
+                    DaemonHandshake.writeSessionId(ctrlOut, currentSession.sessionId)
+                    DaemonHandshake.writeDisplayId(ctrlOut, displayId)
+                    val ack = DaemonHandshake.readInt32(ctrl.inputStream)
+                    if (ack != displayId) {
+                        ctrl.close()
+                        throw IOException("Control socket displayId ack mismatch: expected $displayId, server ack=$ack")
+                    }
+                    controlSocket = ctrl
+                    controlIn = DataInputStream(ctrl.inputStream)
+                    controlOut = DataOutputStream(ctrlOut)
+                    Log.i(TAG, "ROLE_CONTROL auto-reconnected (attempt=${attempt + 1}, session=${currentSession.sessionId}, displayId=$displayId)")
+                    return controlOut
+                } catch (e: IOException) {
+                    Log.w(TAG, "ROLE_CONTROL reconnect attempt ${attempt + 1} failed", e)
+                    closeControlChannelLocked()
+                }
+            }
+            return null
+        }
+    }
+
     fun disconnectScrcpyChannels() {
         runCatching { controlIn?.close() }
         runCatching { controlOut?.close() }
@@ -140,6 +211,7 @@ class DaemonTransport {
         controlOut = null
         controlSocket = null
         videoSocket = null
+        controlDisplayId = -1
         Log.i(TAG, "Scrcpy channels disconnected")
     }
 
