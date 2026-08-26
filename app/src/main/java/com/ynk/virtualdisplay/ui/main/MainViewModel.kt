@@ -7,11 +7,18 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ynk.virtualdisplay.data.AppSettings
 import com.ynk.virtualdisplay.data.model.ShizukuState
-import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
 //import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP
 import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_PUBLIC
 //import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS
-import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_TRUSTED
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_OWN_FOCUS
+import com.ynk.virtualdisplay.data.model.VIRTUAL_DISPLAY_FLAG_DEVICE_DISPLAY_GROUP
 import com.ynk.virtualdisplay.data.repository.ConnectionStatus
 import com.ynk.virtualdisplay.domain.DisplayInteractor
 import com.ynk.virtualdisplay.manager.DisplayMetricsManager
@@ -385,12 +392,21 @@ class MainViewModel(
     }
 
     suspend fun createDesktopDisplay(): Result<Int> {
+        // Match the flags used by scrcpy's normal secondary-display path as
+        // closely as possible. These flags describe a presentation/secondary
+        // display; they do not create a separate freeform task model.
         val desktopFlags =
             VIRTUAL_DISPLAY_FLAG_PUBLIC or
+            VIRTUAL_DISPLAY_FLAG_PRESENTATION or
             VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
-            VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH //or
-            //VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS or
-            //VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP
+            VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT or
+           VIRTUAL_DISPLAY_FLAG_TRUSTED or
+           VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP or
+           VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED or
+           VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED or
+           VIRTUAL_DISPLAY_FLAG_OWN_FOCUS or
+           VIRTUAL_DISPLAY_FLAG_DEVICE_DISPLAY_GROUP
+
 
         return interactor.createDisplay(
             name = "Desktop 1080p",
