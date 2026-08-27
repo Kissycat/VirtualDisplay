@@ -27,6 +27,8 @@ class DisplayControlPanel(
     private val onDesktopHomeClick: () -> Unit,
     private val onAppLauncherClick: () -> Unit,
     private val onKeyboardClick: () -> Unit,
+    private val onTrackpadClick: () -> Unit,
+    private val showTrackpadButton: Boolean,
     private val onWebRtcClick: () -> Unit,
     private val onCloseClick: () -> Unit
 ) : LinearLayout(context) {
@@ -171,7 +173,43 @@ class DisplayControlPanel(
         }
         buttonsContainer.addView(keyboardButton)
 
-        // 6. WebRTC button. It is available in both normal and desktop modes.
+        if (showTrackpadButton) {
+            // 6. Normal-mode optional touchpad switch. Desktop mode is always
+            // touchpad/mouse-driven, so it does not expose this toggle.
+            val trackpadButton = TextView(context).apply {
+                text = "T"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                gravity = Gravity.CENTER
+                layoutParams = LayoutParams((32 * density).toInt(), (32 * density).toInt()).apply {
+                    setMargins(0, (4 * density).toInt(), 0, (4 * density).toInt())
+                }
+                setPadding((4 * density).toInt(), (4 * density).toInt(), (4 * density).toInt(), (4 * density).toInt())
+                isClickable = true
+                isFocusable = true
+                val backgroundDrawable = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor("#10FFFFFF".toColorInt())
+                }
+                background = backgroundDrawable
+                setOnTouchListener { _, event ->
+                    resetCollapseTimer()
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> backgroundDrawable.setColor("#30FFFFFF".toColorInt())
+                        MotionEvent.ACTION_UP -> {
+                            backgroundDrawable.setColor("#10FFFFFF".toColorInt())
+                            onTrackpadClick()
+                        }
+                        MotionEvent.ACTION_CANCEL -> backgroundDrawable.setColor("#10FFFFFF".toColorInt())
+                    }
+                    true
+                }
+                tag = backgroundDrawable
+            }
+            buttonsContainer.addView(trackpadButton)
+        }
+
+        // 7. WebRTC button. It is available in both normal and desktop modes.
         val webRtcButton = TextView(context).apply {
             text = "W"
             setTextColor(Color.WHITE)

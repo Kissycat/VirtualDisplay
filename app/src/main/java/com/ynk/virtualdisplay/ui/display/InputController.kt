@@ -73,21 +73,42 @@ class InputController(
     private val trackpadLongPressMs = 320L
 
     fun setTrackpadModeEnabled(enabled: Boolean) {
-        if (trackpadModeEnabled == enabled) return
-        trackpadModeEnabled = enabled
+        if (trackpadModeEnabled == enabled) {
+            // Even when the logical state is unchanged, explicitly clearing any
+            // residual gesture state makes mode transitions deterministic.
+            if (!enabled) {
+                clearTrackpadGestureState()
+            }
+            return
+        }
+
         if (!enabled) {
             val displayId = displayIdProvider()
             if (displayId != null && trackpadDragging) {
                 injectMouseUp(displayId)
             }
-            trackpadDragging = false
-            trackpadLongPressStarted = false
-            trackpadLongPressConsumed = false
-            trackpadTwoFinger = false
-            trackpadMoved = false
-            trackpadTapCancelled = false
+            clearTrackpadGestureState()
         }
+        trackpadModeEnabled = enabled
         Log.i(TAG, "trackpadModeEnabled=$enabled")
+    }
+
+    private fun clearTrackpadGestureState() {
+        trackpadDragging = false
+        trackpadLongPressStarted = false
+        trackpadLongPressConsumed = false
+        trackpadTwoFinger = false
+        trackpadMoved = false
+        trackpadTapCancelled = false
+        trackpadDownTime = 0L
+        trackpadLastX = 0f
+        trackpadLastY = 0f
+        trackpadDownX = 0f
+        trackpadDownY = 0f
+        trackpadDragArmX = 0f
+        trackpadDragArmY = 0f
+        trackpadTwoFingerStartY = 0f
+        trackpadTwoFingerLastY = 0f
     }
 
     fun updateVideoSize(width: Int, height: Int) {

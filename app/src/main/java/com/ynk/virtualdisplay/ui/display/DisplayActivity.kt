@@ -67,6 +67,7 @@ class DisplayActivity : ComponentActivity() {
     private var currentVideoRotation = 0
     private var desktopMode = false
     private var desktopWebRtcRunning = false
+    private var trackpadEnabled = false
 
     // Tracks the surface reported by VideoSurfaceView before videoWidth/Height
     // are known. Without this, onSurfaceAvailable drops the surface when
@@ -129,6 +130,10 @@ class DisplayActivity : ComponentActivity() {
         remoteDisplayId = displayId
         nodeKey = intent.getStringExtra("node_key")
         desktopMode = intent.getBooleanExtra("desktop_mode", false)
+        // Desktop mode is inherently a trackpad/mouse-only surface. Normal mode
+        // keeps the legacy touchscreen behavior unless the user explicitly enables
+        // the touchpad switch.
+        trackpadEnabled = desktopMode
 
         requestHighRefreshRate()
         enterFullscreen()
@@ -139,7 +144,7 @@ class DisplayActivity : ComponentActivity() {
             displayIdProvider = { remoteDisplayId },
             scope = lifecycleScope,
         )
-        inputController.setTrackpadModeEnabled(false)
+        inputController.setTrackpadModeEnabled(trackpadEnabled)
 
         backCallback = object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -193,6 +198,7 @@ class DisplayActivity : ComponentActivity() {
 
     override fun onDestroy() {
         desktopWebRtcMonitorJob?.cancel()
+        runCatching { repository.stopWebRtcH264Output() }
         runCatching { gatewayProcessController.stop() }
         super.onDestroy()
         backCallback.remove()
@@ -320,6 +326,8 @@ class DisplayActivity : ComponentActivity() {
             },
             onAppLauncherClick = { showAppSelectionDialog() },
             onKeyboardClick = { toggleKeyboard() },
+            onTrackpadClick = { toggleTrackpadMode() },
+            showTrackpadButton = !desktopMode,
             onWebRtcClick = { toggleWebRtc() },
             onCloseClick = { finish() },
         )
@@ -359,45 +367,74 @@ class DisplayActivity : ComponentActivity() {
         }
     }
 
-    private fun updateWebRtcUi(running: Boolean) {
-        if (running) {
-            // Once H.264/WebRTC output is actually running, the phone-side video
-            // surface must be removed from the UI. The remote browser owns the
-            // display image now. Desktop mode additionally switches the same
-            // surface into the mouse/trackpad interaction model.
-            if (desktopMode) {
-                inputController.cancelActiveTouch()
-                inputController.setTrackpadModeEnabled(true)
-                DesktopCursorState.reset(1920, 1080)
-                rootLayout.setBackgroundColor(Color.rgb(28, 28, 28))
-            } else {
-                inputController.setTrackpadModeEnabled(false)
-                inputController.cancelActiveTouch()
-                rootLayout.setBackgroundColor(Color.BLACK)
-            }
+    private fun shouldHideLocalPreview(webRtcRunning: Boolean): Boolean {
+        // Desktop mode is inherently operated as a touchpad when WebRTC is active.
+        // Normal mode hides the local preview only when BOTH WebRTC and the
+        // explicitly enabled touchpad mode are active. WebRTC alone must keep
+        // showing the phone-side preview.
+        return webRtcRunning && (desktopMode || trackpadEnabled)
+    }
 
-            if (::videoSurfaceView.isInitialized) {
-                videoSurfaceView.visibility = View.INVISIBLE
-            }
-            if (::controlPanel.isInitialized) {
-                controlPanel.visibility = View.VISIBLE
-            }
-            if (::statsOverlay.isInitialized) {
-                statsOverlay.visibility = View.GONE
-            }
-            Log.i(TAG, "WebRTC is running: local video hidden, desktopMode=$desktopMode")
-        } else {
-            inputController.setTrackpadModeEnabled(false)
-            inputController.cancelActiveTouch()
-            if (::videoSurfaceView.isInitialized) {
-                videoSurfaceView.visibility = View.VISIBLE
-            }
-            if (::controlPanel.isInitialized) {
-                controlPanel.visibility = View.VISIBLE
-            }
-            rootLayout.setBackgroundColor(if (desktopMode) Color.BLACK else Color.TRANSPARENT)
-            Log.i(TAG, "WebRTC stopped: local video restored, desktopMode=$desktopMode")
+    private fun updateWebRtcUi(running: Boolean) {
+        // Always clear any old input mode before switching state. In particular,
+        // disabling the normal-mode touchpad must leave the next gesture entirely
+        // on the legacy touchscreen path.
+        inputController.cancelActiveTouch()
+        inputController.setTrackpadModeEnabled(if (desktopMode) true else trackpadEnabled)
+
+        if (running && (desktopMode || trackpadEnabled)) {
+            DesktopCursorState.reset(1920, 1080)
         }
+
+        val hideLocalPreview = shouldHideLocalPreview(running)
+        if (::videoSurfaceView.isInitialized) {
+            videoSurfaceView.visibility = if (hideLocalPreview) View.INVISIBLE else View.VISIBLE
+        }
+        if (::rootLayout.isInitialized) {
+            rootLayout.setBackgroundColor(if (hideLocalPreview) Color.BLACK else Color.TRANSPARENT)
+        }
+        if (::controlPanel.isInitialized) {
+            controlPanel.visibility = View.VISIBLE
+        }
+        if (::statsOverlay.isInitialized) {
+            statsOverlay.visibility = if (hideLocalPreview) View.GONE else View.VISIBLE
+        }
+
+        Log.i(
+            TAG,
+            "WebRTC UI updated: running=$running desktopMode=$desktopMode " +
+                "trackpadEnabled=$trackpadEnabled hideLocalPreview=$hideLocalPreview"
+        )
+    }
+
+    private fun toggleTrackpadMode() {
+        if (desktopMode) return
+
+        val newEnabled = !trackpadEnabled
+
+        // Finish every remote gesture before changing input mode. When switching
+        // back to touchscreen mode this prevents a previous mouse/touchpad gesture
+        // from leaking into the first subsequent touchscreen gesture.
+        inputController.cancelActiveTouch()
+        trackpadEnabled = newEnabled
+        inputController.setTrackpadModeEnabled(newEnabled)
+
+        val running = repository.getWebRtcH264OutputStatus().running
+        val hideLocalPreview = shouldHideLocalPreview(running)
+        if (::videoSurfaceView.isInitialized) {
+            videoSurfaceView.visibility = if (hideLocalPreview) View.INVISIBLE else View.VISIBLE
+        }
+        if (::rootLayout.isInitialized) {
+            rootLayout.setBackgroundColor(if (hideLocalPreview) Color.BLACK else Color.TRANSPARENT)
+        }
+        if (::controlPanel.isInitialized) {
+            controlPanel.visibility = View.VISIBLE
+        }
+        if (::statsOverlay.isInitialized) {
+            statsOverlay.visibility = if (hideLocalPreview) View.GONE else View.VISIBLE
+        }
+        DesktopCursorState.reset(1920, 1080)
+        Log.i(TAG, "trackpadEnabled=$trackpadEnabled running=$running hideLocalPreview=$hideLocalPreview")
     }
 
     private fun toggleWebRtc() {
@@ -408,8 +445,11 @@ class DisplayActivity : ComponentActivity() {
         }
         lifecycleScope.launch(Dispatchers.IO) {
             if (repository.getWebRtcH264OutputStatus().running) {
-                runCatching { gatewayProcessController.stop() }
+                // Stop the APK-owned H.264 endpoint through the repository first,
+                // then terminate the external gateway. Never use the debug HTTP API
+                // for the in-app shutdown path.
                 repository.stopWebRtcH264Output()
+                runCatching { gatewayProcessController.stop() }
                 runOnUiThread { android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 已停止", android.widget.Toast.LENGTH_SHORT).show() }
                 return@launch
             }
@@ -687,12 +727,10 @@ class DisplayActivity : ComponentActivity() {
 
     @SuppressLint("RestrictedApi")
     private fun handleTouchEvent(event: MotionEvent): Boolean {
-        if (desktopMode) {
-            // Desktop mode is a hard input boundary: the phone surface is always
-            // a trackpad. Never fall through to the legacy touchscreen path,
-            // regardless of WebRTC polling timing or local video visibility.
-            // This removes the race that allowed MOVE events to be injected as
-            // SOURCE_TOUCHSCREEN while the software mouse was moving.
+        if (desktopMode || trackpadEnabled) {
+            // Desktop mode is always a trackpad surface. Normal mode enters the
+            // same path only when the user enables the explicit touchpad switch.
+            // Never fall through to the legacy touchscreen path in either case.
             return inputController.handleTrackpadEvent(rootLayout, event)
         }
 

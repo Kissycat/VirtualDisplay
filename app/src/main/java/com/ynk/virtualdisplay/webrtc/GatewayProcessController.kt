@@ -7,7 +7,6 @@ import com.ynk.virtualdisplay.data.AppSettings
 import com.ynk.virtualdisplay.data.PrivilegeMode
 import rikka.shizuku.Shizuku
 import java.io.IOException
-import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URL
@@ -80,26 +79,14 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         }
     }
 
-    /** Stops H264 output first, then terminates the gateway process if we own it. */
+    /** Stops only the bundled gateway process. The APK-owned H.264 endpoint is stopped
+     * directly by the repository; the debug HTTP API is never used for in-app shutdown. */
     @Synchronized
     fun stop() {
-        stopH264Output(DEFAULT_CONTROL_PORT)
         stopRemoteGateway()
         pid = -1
         runCatching {
             runPrivilegedShell("rm -f $REMOTE_PATH $LOG_PATH $PID_PATH")
-        }
-    }
-
-    private fun stopH264Output(controlPort: Int) {
-        runCatching {
-            val conn = (URL("http://127.0.0.1:$controlPort/api/webrtc/stop").openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 1_000
-                readTimeout = 2_000
-            }
-            conn.responseCode
-            conn.disconnect()
         }
     }
 
@@ -109,23 +96,47 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         val bytes = context.assets.open(assetPath).use { it.readBytes() }
         if (bytes.isEmpty()) throw IOException("Gateway binary asset is empty: $assetPath")
 
-        val command = "cat > $REMOTE_PATH && chmod 700 $REMOTE_PATH"
+        // Do not wait for the Shizuku Process to report shell termination. On some
+        // Shizuku implementations the returned Process wrapper may stay non-terminal
+        // even though the privileged writer has already created the file successfully.
+        // Instead, the shell emits an explicit completion marker and we fall back to a
+        // privileged file-size check.
+        val command = "cat > '$REMOTE_PATH' && chmod 700 '$REMOTE_PATH' && echo VDGW_INSTALL_OK"
         val writer = executePrivileged(arrayOf("sh", "-c", command))
             ?: throw IOException("Failed to create privileged writer")
         try {
             writer.outputStream.use { it.write(bytes); it.flush() }
-            val completed = runCatching { writer.waitFor(15, TimeUnit.SECONDS) }.getOrDefault(false)
-            if (!completed) {
-                writer.destroy()
-                throw IOException("Timed out installing gateway binary")
+
+            val stdoutFuture = java.util.concurrent.FutureTask<String> {
+                writer.inputStream.bufferedReader().readText()
             }
-            if (writer.exitValue() != 0) {
-                val err = runCatching { writer.errorStream.bufferedReader().readText() }.getOrDefault("")
-                throw IOException("Failed to install gateway: ${err.ifBlank { "exit=${writer.exitValue()}" }}")
+            Thread(stdoutFuture, "gateway-install-output").apply { isDaemon = true }.start()
+
+            val marker = runCatching { stdoutFuture.get(4, TimeUnit.SECONDS) }.getOrNull().orEmpty()
+            val ok = marker.contains("VDGW_INSTALL_OK") || remoteFileLooksValid(bytes.size)
+            if (!ok) {
+                val err = runCatching {
+                    writer.errorStream.bufferedReader().readText()
+                }.getOrDefault("")
+                throw IOException("Gateway binary installation could not be verified${if (err.isBlank()) "" else ": $err"}")
             }
         } finally {
+            runCatching { writer.destroy() }
             runCatching { writer.inputStream.close() }
             runCatching { writer.errorStream.close() }
+        }
+    }
+
+
+    private fun remoteFileLooksValid(expectedSize: Int): Boolean {
+        val proc = executePrivileged(arrayOf("sh", "-c", "test -s '$REMOTE_PATH' && wc -c < '$REMOTE_PATH' || echo 0")) ?: return false
+        return try {
+            val future = java.util.concurrent.FutureTask<String> { proc.inputStream.bufferedReader().readText().trim() }
+            Thread(future, "gateway-install-verify").apply { isDaemon = true }.start()
+            val size = runCatching { future.get(2, TimeUnit.SECONDS).toLongOrNull() }.getOrNull() ?: return false
+            size == expectedSize.toLong()
+        } finally {
+            runCatching { proc.destroy() }
         }
     }
 
