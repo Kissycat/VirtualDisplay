@@ -20,10 +20,12 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.lifecycle.lifecycleScope
 import com.ynk.virtualdisplay.domain.DisplayInteractor
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.koin.android.ext.android.inject
 import rikka.shizuku.Shizuku
 import java.io.BufferedReader
@@ -45,6 +47,9 @@ class DesktopShellActivity : ComponentActivity() {
     private var decorationJob: Job? = null
     private var currentTargetPackage: String = ""
     private var desktopDisplayId: Int = Display.DEFAULT_DISPLAY
+    private var taskbarAppsContainer: LinearLayout? = null
+    private var taskbarMonitorJob: Job? = null
+    private var renderedTaskbarSignature: List<Int> = emptyList()
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         desktopDisplayId = display?.displayId ?: intent.getIntExtra("display_id", Display.DEFAULT_DISPLAY)
@@ -82,14 +87,22 @@ class DesktopShellActivity : ComponentActivity() {
             marginEnd = dp(10)
         })
 
-        val title = TextView(this).apply {
-            text = "Virtual Desktop   •   1920×1080  •  160 DPI"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            gravity = Gravity.CENTER_VERTICAL
-            alpha = 0.88f
+        val taskScroll = android.widget.HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            background = null
         }
-        taskbar.addView(title, LinearLayout.LayoutParams(0, dp(52), 1f))
+        taskbarAppsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), 0, dp(4), 0)
+        }
+        taskScroll.addView(taskbarAppsContainer, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)
+        ))
+        taskbar.addView(taskScroll, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+            marginEnd = dp(8)
+        })
 
         val clock = TextView(this).apply {
             text = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
@@ -105,6 +118,7 @@ class DesktopShellActivity : ComponentActivity() {
         ))
 
         setContentView(root)
+        startTaskbarMonitor()
     }
 
 
@@ -162,17 +176,67 @@ class DesktopShellActivity : ComponentActivity() {
     private fun launchExternalApp(info: ResolveInfo) {
         val packageName = info.activityInfo.packageName
         val displayId = desktopDisplayId
-        lifecycleScope.launch {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val existing = VirtualDisplayTaskManager.findTaskByPackage(this@DesktopShellActivity, displayId, packageName)
+            if (existing != null && VirtualDisplayTaskManager.focusTask(existing.taskId)) {
+                withContext(Dispatchers.Main) { refreshTaskbar() }
+                return@launch
+            }
             val result = displayInteractor.launchApp(packageName, displayId, freeform = false)
-            result.onSuccess {
-                // App is deliberately launched full-screen on this virtual display.
-                // The physical-screen control dock remains available for switching apps.
-            }.onFailure {
-                Toast.makeText(
-                    this@DesktopShellActivity,
-                    "启动失败：${it.message ?: "daemon 拒绝启动"}",
-                    Toast.LENGTH_LONG
-                ).show()
+            // ActivityManager may publish the new task slightly after startActivity returns.
+            delay(300)
+            withContext(Dispatchers.Main) {
+                result.onFailure {
+                    Toast.makeText(
+                        this@DesktopShellActivity,
+                        "启动失败：${it.message ?: "daemon 拒绝启动"}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                refreshTaskbar()
+            }
+        }
+    }
+
+    private fun startTaskbarMonitor() {
+        taskbarMonitorJob?.cancel()
+        taskbarMonitorJob = lifecycleScope.launch {
+            while (isActive && !isFinishing && !isDestroyed) {
+                refreshTaskbar()
+                delay(1000)
+            }
+        }
+    }
+
+    private suspend fun refreshTaskbar() {
+        val tasks = withContext(Dispatchers.IO) {
+            VirtualDisplayTaskManager.findTasks(this@DesktopShellActivity, desktopDisplayId)
+        }
+        withContext(Dispatchers.Main) {
+            val container = taskbarAppsContainer ?: return@withContext
+            val signature = tasks.map { it.taskId }
+            if (signature == renderedTaskbarSignature) return@withContext
+            renderedTaskbarSignature = signature
+            container.removeAllViews()
+            val pm = packageManager
+            tasks.forEach { task ->
+                val label = runCatching {
+                    pm.getApplicationInfo(task.packageName, 0).loadLabel(pm).toString()
+                }.getOrDefault(task.packageName)
+                val item = button(label) {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        if (!VirtualDisplayTaskManager.focusTask(task.taskId)) {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(this@DesktopShellActivity, "无法切换到 ${label}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                }
+                item.maxLines = 1
+                item.ellipsize = android.text.TextUtils.TruncateAt.END
+                container.addView(item, LinearLayout.LayoutParams(dp(150), dp(48)).apply {
+                    marginEnd = dp(6)
+                })
             }
         }
     }
@@ -283,6 +347,8 @@ class DesktopShellActivity : ComponentActivity() {
     data class TaskInfo(val taskId: Int, val bounds: Rect, val packageName: String)
 
     override fun onDestroy() {
+        taskbarMonitorJob?.cancel()
+        decorationJob?.cancel()
         super.onDestroy()
     }
 

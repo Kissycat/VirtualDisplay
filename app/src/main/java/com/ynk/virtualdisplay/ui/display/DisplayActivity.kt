@@ -39,6 +39,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import org.koin.android.ext.android.inject
 import com.ynk.virtualdisplay.webrtc.GatewayProcessController
+import com.ynk.virtualdisplay.ui.desktop.VirtualDisplayTaskManager
 
 @SuppressLint("ClickableViewAccessibility", "UseKtx")
 class DisplayActivity : ComponentActivity() {
@@ -68,6 +69,13 @@ class DisplayActivity : ComponentActivity() {
     private var desktopMode = false
     private var desktopWebRtcRunning = false
     private var trackpadEnabled = false
+
+    // Four-finger desktop gestures are consumed as one gesture so they never
+    // reach the normal mouse/touchpad path.
+    private var fourFingerGestureActive = false
+    private var fourFingerGestureTriggered = false
+    private var fourFingerStartX = 0f
+    private var fourFingerStartY = 0f
 
     // Tracks the surface reported by VideoSurfaceView before videoWidth/Height
     // are known. Without this, onSurfaceAvailable drops the surface when
@@ -695,7 +703,10 @@ class DisplayActivity : ComponentActivity() {
      * original rootLayout touch listener and touchscreen injection path.
      */
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        if (!desktopMode) {
+        // The single-input entry point is also used by normal mode when the
+        // explicit Touchpad switch is enabled. Pure touchscreen mode delegates
+        // to the original view hierarchy unchanged.
+        if (!desktopMode && !trackpadEnabled) {
             return super.dispatchTouchEvent(event)
         }
 
@@ -707,6 +718,14 @@ class DisplayActivity : ComponentActivity() {
             return super.dispatchTouchEvent(event)
         }
 
+        // Four-finger gestures are a desktop-only command layer. Once the
+        // fourth pointer arrives, consume the entire gesture and do not feed
+        // any of it into the mouse/trackpad state machine.
+        if (fourFingerGestureActive || event.pointerCount >= 4) {
+            handleFourFingerGesture(event)
+            return true
+        }
+
         if (::inputController.isInitialized && ::rootLayout.isInitialized) {
             inputController.handleTrackpadEvent(rootLayout, event)
         }
@@ -714,6 +733,78 @@ class DisplayActivity : ComponentActivity() {
         // Hard-consume the event so VideoSurfaceView and rootLayout never see
         // the same gesture after the desktop trackpad has handled it.
         return true
+    }
+
+    private fun handleFourFingerGesture(event: MotionEvent) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_MOVE, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP -> {
+                if (event.pointerCount >= 4 && !fourFingerGestureActive) {
+                    fourFingerGestureActive = true
+                    fourFingerGestureTriggered = false
+                    var sx = 0f
+                    var sy = 0f
+                    for (i in 0 until event.pointerCount) {
+                        sx += event.getX(i)
+                        sy += event.getY(i)
+                    }
+                    fourFingerStartX = sx / event.pointerCount
+                    fourFingerStartY = sy / event.pointerCount
+                }
+
+                if (fourFingerGestureActive && !fourFingerGestureTriggered && event.pointerCount >= 4) {
+                    var x = 0f
+                    var y = 0f
+                    for (i in 0 until event.pointerCount) {
+                        x += event.getX(i)
+                        y += event.getY(i)
+                    }
+                    val cx = x / event.pointerCount
+                    val cy = y / event.pointerCount
+                    val dx = cx - fourFingerStartX
+                    val dy = cy - fourFingerStartY
+                    val threshold = TypedValue.applyDimension(
+                        TypedValue.COMPLEX_UNIT_DIP,
+                        120f,
+                        resources.displayMetrics
+                    )
+
+                    if (kotlin.math.hypot(dx.toDouble(), dy.toDouble()) >= threshold) {
+                        fourFingerGestureTriggered = true
+                        val id = remoteDisplayId
+                        when {
+                            -dy > kotlin.math.abs(dx) * 1.15f -> {
+                                if (id != null) {
+                                    lifecycleScope.launch {
+                                        repository.launchHome(id)
+                                            .onFailure { Log.w(TAG, "Four-finger home failed", it) }
+                                    }
+                                }
+                            }
+                            -dx > kotlin.math.abs(dy) * 1.15f -> {
+                                if (id != null) {
+                                    lifecycleScope.launch(Dispatchers.IO) {
+                                        VirtualDisplayTaskManager.focusRelativeTask(
+                                            this@DisplayActivity, id, +1
+                                        )
+                                    }
+                                }
+                            }
+                            dx > kotlin.math.abs(dy) * 1.15f -> {
+                                inputController.injectKey(KeyEvent.KEYCODE_BACK)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (event.actionMasked == MotionEvent.ACTION_UP ||
+            event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            fourFingerGestureActive = false
+            fourFingerGestureTriggered = false
+            fourFingerStartX = 0f
+            fourFingerStartY = 0f
+        }
     }
 
     private fun isPointInsideView(rawX: Float, rawY: Float, view: View): Boolean {
@@ -820,7 +911,11 @@ class DisplayActivity : ComponentActivity() {
                         .setItems(names) { _, which ->
                             val selectedApp = sortedAppList[which]
                             val id = remoteDisplayId ?: return@setItems
-                            lifecycleScope.launch {
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                val existing = VirtualDisplayTaskManager.findTaskByPackage(this@DisplayActivity, id, selectedApp.packageName)
+                                if (existing != null && VirtualDisplayTaskManager.focusTask(existing.taskId)) {
+                                    return@launch
+                                }
                                 repository.launchApp(selectedApp.packageName, id, freeform = false)
                             }
                         }
