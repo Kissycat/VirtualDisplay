@@ -916,6 +916,14 @@ class DisplayActivity : ComponentActivity() {
                                 if (existing != null && VirtualDisplayTaskManager.focusTask(existing.taskId)) {
                                     return@launch
                                 }
+                                val foreign = VirtualDisplayTaskManager.findTaskOnOtherDisplay(
+                                    this@DisplayActivity, id, selectedApp.packageName
+                                )
+                                if (foreign != null && VirtualDisplayTaskManager.moveExistingTaskToDisplay(
+                                        this@DisplayActivity, foreign, id
+                                    )) {
+                                    return@launch
+                                }
                                 repository.launchApp(selectedApp.packageName, id, freeform = false)
                             }
                         }

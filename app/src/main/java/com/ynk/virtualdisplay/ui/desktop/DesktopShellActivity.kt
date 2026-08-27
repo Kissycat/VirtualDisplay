@@ -50,6 +50,7 @@ class DesktopShellActivity : ComponentActivity() {
     private var taskbarAppsContainer: LinearLayout? = null
     private var taskbarMonitorJob: Job? = null
     private var renderedTaskbarSignature: List<Int> = emptyList()
+    @Volatile private var desktopWindowFocused = false
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         desktopDisplayId = display?.displayId ?: intent.getIntExtra("display_id", Display.DEFAULT_DISPLAY)
@@ -118,9 +119,45 @@ class DesktopShellActivity : ComponentActivity() {
         ))
 
         setContentView(root)
-        startTaskbarMonitor()
     }
 
+
+    override fun onResume() {
+        super.onResume()
+        // Task discovery is allowed only while the DesktopShell itself is the
+        // focused/visible window. This keeps dumpsys/shizuku work completely
+        // out of the active full-screen application/video path.
+        if (window.decorView.hasWindowFocus()) {
+            desktopWindowFocused = true
+            lifecycleScope.launch {
+                refreshTaskbar()
+                startTaskbarMonitor()
+            }
+        }
+    }
+
+    override fun onPause() {
+        desktopWindowFocused = false
+        taskbarMonitorJob?.cancel()
+        taskbarMonitorJob = null
+        super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        desktopWindowFocused = hasFocus
+        if (hasFocus && !isFinishing && !isDestroyed) {
+            taskbarMonitorJob?.cancel()
+            taskbarMonitorJob = lifecycleScope.launch {
+                // Query immediately when we really return to the desktop.
+                refreshTaskbar()
+                startTaskbarMonitor()
+            }
+        } else {
+            taskbarMonitorJob?.cancel()
+            taskbarMonitorJob = null
+        }
+    }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -179,9 +216,18 @@ class DesktopShellActivity : ComponentActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             val existing = VirtualDisplayTaskManager.findTaskByPackage(this@DesktopShellActivity, displayId, packageName)
             if (existing != null && VirtualDisplayTaskManager.focusTask(existing.taskId)) {
-                withContext(Dispatchers.Main) { refreshTaskbar() }
                 return@launch
             }
+
+            val foreign = VirtualDisplayTaskManager.findTaskOnOtherDisplay(
+                this@DesktopShellActivity, displayId, packageName
+            )
+            if (foreign != null && VirtualDisplayTaskManager.moveExistingTaskToDisplay(
+                    this@DesktopShellActivity, foreign, displayId
+                )) {
+                return@launch
+            }
+
             val result = displayInteractor.launchApp(packageName, displayId, freeform = false)
             // ActivityManager may publish the new task slightly after startActivity returns.
             delay(300)
@@ -201,14 +247,19 @@ class DesktopShellActivity : ComponentActivity() {
     private fun startTaskbarMonitor() {
         taskbarMonitorJob?.cancel()
         taskbarMonitorJob = lifecycleScope.launch {
-            while (isActive && !isFinishing && !isDestroyed) {
-                refreshTaskbar()
-                delay(1000)
+            delay(2000)
+            while (isActive && desktopWindowFocused && !isFinishing && !isDestroyed) {
+                if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) &&
+                    window.decorView.hasWindowFocus()) {
+                    refreshTaskbar()
+                }
+                delay(2000)
             }
         }
     }
 
     private suspend fun refreshTaskbar() {
+        if (!desktopWindowFocused || !window.decorView.hasWindowFocus()) return
         val tasks = withContext(Dispatchers.IO) {
             VirtualDisplayTaskManager.findTasks(this@DesktopShellActivity, desktopDisplayId)
         }
