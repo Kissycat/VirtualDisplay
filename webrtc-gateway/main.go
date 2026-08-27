@@ -13,7 +13,7 @@ import (
 	"os"
 	"sync"
 	"time"
-
+	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
@@ -304,7 +304,17 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+	// 创建拦截器注册表
+	i := &interceptor.Registry{}
+	
+	// 注册默认拦截器 (提供 NACK 丢包重传、RTCP 报告等基础能力)
+	if err = webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 将拦截器注入到 API 中
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		http.Error(w, err.Error(), 500)

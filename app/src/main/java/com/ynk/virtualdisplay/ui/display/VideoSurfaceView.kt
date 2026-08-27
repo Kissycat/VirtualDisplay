@@ -47,6 +47,10 @@ class VideoSurfaceView @JvmOverloads constructor(
     init {
         isFocusable = false
         isFocusableInTouchMode = false
+        // Keep the SurfaceView on the normal media composition path. Do NOT
+        // force TRANSLUCENT or setZOrderOnTop(true): doing so can move the
+        // surface onto a separate/top composition layer, cover overlay
+        // controls, and on some devices make composition less predictable.
         setZOrderOnTop(false)
         setZOrderMediaOverlay(false)
         holder.addCallback(object : SurfaceHolder.Callback {

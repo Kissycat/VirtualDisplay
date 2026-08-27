@@ -1,5 +1,6 @@
 package com.ynk.virtualdisplay.video.output
 
+import android.os.Process
 import android.util.Log
 import com.ynk.virtualdisplay.video.EncodedVideoSink
 import com.ynk.virtualdisplay.video.VideoStreamController
@@ -12,6 +13,7 @@ import java.net.Socket
 import java.net.SocketException
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.LinkedBlockingDeque
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -57,6 +59,13 @@ class WebRtcH264TcpEndpoint(
     }
 
     private data class FramePacket(val bytes: ByteArray, val isConfig: Boolean = false, val isKeyFrame: Boolean = false)
+
+    private data class RawFrame(
+        val ptsUs: Long,
+        val isConfig: Boolean,
+        val isKeyFrame: Boolean,
+        val data: ByteArray,
+    )
 
     private class Client(
         private val socket: Socket,
@@ -195,6 +204,9 @@ class WebRtcH264TcpEndpoint(
         }
     }
 
+    // Never serialize or fan-out WebRTC packets on H264StreamDecoder.runInputLoop().
+    private val rawFrameQueue = java.util.concurrent.ArrayBlockingQueue<RawFrame>(12)
+    private val outputWorker = Thread({ runOutputWorker() }, "webrtc-h264-output-$port")
     private val running = AtomicBoolean(false)
     private val clients = CopyOnWriteArraySet<Client>()
     private val serverLock = Any()
@@ -218,6 +230,7 @@ class WebRtcH264TcpEndpoint(
             serverSocket = server
             running.set(true)
             videoController.addEncodedVideoSink(this)
+            outputWorker.start()
             acceptThread = Thread({ acceptLoop(server) }, "webrtc-h264-accept-$port").also { it.start() }
             Log.i(TAG, "H.264 WebRTC bridge endpoint listening on $bindHost:$port for display=$displayId")
         }
@@ -238,45 +251,65 @@ class WebRtcH264TcpEndpoint(
     override fun onFrame(ptsUs: Long, isConfig: Boolean, isKeyFrame: Boolean, data: ByteArray, size: Int) {
         if (!running.get() || size <= 0) return
 
-        // The callback buffer may be reused by the video pipeline, so cached
-        // packets must own their bytes.
-        val copy = data.copyOfRange(0, size)
+        // The decoder owns/reuses this buffer. Make one bounded copy and return
+        // immediately; all packetization/network work happens on outputWorker.
+        val frame = RawFrame(ptsUs, isConfig, isKeyFrame, data.copyOf(size))
+        if (isConfig || isKeyFrame) {
+            while (!rawFrameQueue.offer(frame)) rawFrameQueue.poll()
+        } else {
+            // Never block or apply back-pressure to the video decoder for WebRTC.
+            rawFrameQueue.offer(frame)
+        }
+    }
+
+    private fun runOutputWorker() {
+        try {
+            // Slightly favor the output pump without taking foreground/display priority
+            // away from the decoder/UI threads.
+            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE) }
+            while (running.get() && !Thread.currentThread().isInterrupted) {
+                val frame = rawFrameQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                processRawFrame(frame)
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (t: Throwable) {
+            if (running.get()) Log.e(TAG, "WebRTC output worker failed", t)
+        }
+    }
+
+    private fun processRawFrame(frame: RawFrame) {
+        val size = frame.data.size
         val stream = java.io.ByteArrayOutputStream(1 + 8 + 4 + 4 + size)
-        val out = DataOutputStream(stream)
-        out.writeByte(TYPE_FRAME)
-        out.writeLong(ptsUs)
-
-        var flags = 0
-        if (isConfig) flags = flags or 1
-        if (isKeyFrame) flags = flags or 2
-
-        out.writeInt(flags)
-        out.writeInt(size)
-        out.write(copy)
-        out.flush()
+        DataOutputStream(stream).use { out ->
+            out.writeByte(TYPE_FRAME)
+            out.writeLong(frame.ptsUs)
+            var flags = 0
+            if (frame.isConfig) flags = flags or 1
+            if (frame.isKeyFrame) flags = flags or 2
+            out.writeInt(flags)
+            out.writeInt(size)
+            out.write(frame.data)
+        }
 
         val packet = FramePacket(
             bytes = stream.toByteArray(),
-            isConfig = isConfig,
-            isKeyFrame = isKeyFrame
+            isConfig = frame.isConfig,
+            isKeyFrame = frame.isKeyFrame
         )
 
-        // Always cache decoder-critical packets. A newly connected gateway can
-        // therefore start immediately with SPS/PPS + IDR without waiting for
-        // the next keyframe interval.
-        if (isConfig) {
+        if (frame.isConfig) {
             latestConfig = packet
             latestKeyFrame = null
-            Log.i(TAG, "H.264 CONFIG received from encoder: pts=$ptsUs size=$size head=${hexPrefix(copy, 32)}")
+            Log.i(TAG, "H.264 CONFIG received from encoder: pts=${frame.ptsUs} size=$size head=${hexPrefix(frame.data, 32)}")
         }
-        if (isKeyFrame) {
+        if (frame.isKeyFrame) {
             latestKeyFrame = packet
-            Log.i(TAG, "H.264 KEY received from encoder: pts=$ptsUs size=$size")
+            Log.i(TAG, "H.264 KEY received from encoder: pts=${frame.ptsUs} size=$size")
         }
 
         if (clients.isEmpty()) return
-
-        clients.forEach { it.offer(packet, critical = isConfig || isKeyFrame) }
+        clients.forEach { it.offer(packet, critical = frame.isConfig || frame.isKeyFrame) }
     }
 
     private fun hexPrefix(bytes: ByteArray, max: Int): String {
@@ -336,8 +369,10 @@ class WebRtcH264TcpEndpoint(
             serverSocket = null
             clients.forEach { it.close() }
             clients.clear()
+            rawFrameQueue.clear()
             latestConfig = null
             latestKeyFrame = null
+            outputWorker.interrupt()
             acceptThread?.interrupt()
             acceptThread = null
             Log.i(TAG, "H.264 WebRTC bridge endpoint stopped")

@@ -25,6 +25,27 @@ class DaemonTransport {
         private const val SOCKET_READ_TIMEOUT_MS = 30_000
         // Initial delay for retries.
         private const val RETRY_BASE_DELAY_MS = 100L
+
+        // Local/low-latency video transport tuning.
+        private const val SOCKET_BUFFER_SIZE = 1024 * 1024
+    }
+
+    /**
+     * Apply low-latency socket options to every long-lived daemon channel.
+     *
+     * TCP_NODELAY only affects packets sent by this endpoint; it cannot disable
+     * Nagle on the daemon side. It is nevertheless useful for the control path
+     * and harmless on the receive-heavy video socket.
+     */
+    private fun configureSocket(socket: Socket) {
+        runCatching { socket.tcpNoDelay = true }
+            .onFailure { Log.w(TAG, "Failed to enable TCP_NODELAY", it) }
+        runCatching { socket.receiveBufferSize = SOCKET_BUFFER_SIZE }
+            .onFailure { Log.w(TAG, "Failed to set SO_RCVBUF=$SOCKET_BUFFER_SIZE", it) }
+        runCatching { socket.sendBufferSize = SOCKET_BUFFER_SIZE }
+            .onFailure { Log.w(TAG, "Failed to set SO_SNDBUF=$SOCKET_BUFFER_SIZE", it) }
+        runCatching { socket.keepAlive = true }
+            .onFailure { Log.w(TAG, "Failed to enable SO_KEEPALIVE", it) }
     }
 
     // Accessed across coroutines on Dispatchers.IO: connect()/disconnect()
@@ -115,6 +136,7 @@ class DaemonTransport {
             disconnectScrcpyChannels()
 
             val ctrl = Socket()
+            configureSocket(ctrl)
             ctrl.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
             // Disable timeout for role sockets to prevent Controller thread from dying on idle
             ctrl.soTimeout = 0
@@ -136,6 +158,7 @@ class DaemonTransport {
             Log.i(TAG, "Scrcpy control channel connected (session ${currentSession.sessionId}, displayId=$displayId, ack=$ctrlAck)")
 
             val video = Socket()
+            configureSocket(video)
             video.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
             video.soTimeout = 0
             videoSocket = video
@@ -176,6 +199,7 @@ class DaemonTransport {
             repeat(2) { attempt ->
                 try {
                     val ctrl = Socket()
+                    configureSocket(ctrl)
                     ctrl.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
                     ctrl.soTimeout = 0
                     ctrl.keepAlive = true
@@ -248,6 +272,7 @@ class DaemonTransport {
                 disconnectInternal()
 
                 val negotiation = Socket()
+                configureSocket(negotiation)
                 negotiation.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
                 negotiation.soTimeout = SOCKET_READ_TIMEOUT_MS
                 negotiationSocket = negotiation

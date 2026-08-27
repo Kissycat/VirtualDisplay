@@ -437,6 +437,16 @@ class H264StreamDecoder(
         val dequeuedAtNs: Long
     )
 
+    /**
+     * VSync-paced surface release queue.
+     *
+     * This project already contains the stronger implementation of the
+     * Choreographer-based approach: it owns its Looper thread, keeps at most
+     * two pending decoded frames, serializes releaseOutputBuffer(), and drains
+     * safely before codec rebuild/release. Do not replace it with the simpler
+     * main-thread ConcurrentLinkedQueue example, because that version is not
+     * safe against this decoder's concurrent codec rebuild lifecycle.
+     */
     private inner class SurfaceRenderScheduler(
         private val activeCodec: MediaCodec
     ) : Choreographer.FrameCallback {
