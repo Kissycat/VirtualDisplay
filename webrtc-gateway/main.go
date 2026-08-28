@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -33,8 +34,11 @@ const (
 	typeConfigureSession = 216
 	typeGenericResponse  = 100
 
-	// 4-byte codec id used by com.genymobile.scrcpy.video.VideoCodec.H264.
-	codecH264ID = 0x68323634
+	// Codec identifiers used by the built-in scrcpy daemon.
+	// The reference scrcpy Java project normally uses the ASCII token H264,
+	// while this VirtualDisplay build exposes its internal enum/tag as 0x20000000.
+	codecH264ID       = 0x68323634
+	codecH264LegacyID = 0x20000000
 
 	// Streamer packet flags.
 	packetFlagSession  uint32 = 1 << 31
@@ -269,16 +273,55 @@ type h264Source struct {
 }
 
 func main() {
+	testMode := flag.Bool("t", false, "test mode: allow direct startup without DISPLAY_ID; defaults to display 0")
+	flagDisplayID := flag.Int("display-id", -1, "scrcpy display id; overrides DISPLAY_ID")
+	flagDaemon := flag.String("daemon", "", "scrcpy daemon address; overrides DAEMON_ADDR")
+	flagListen := flag.String("listen", "", "HTTP listen address; overrides LISTEN")
+	flagToken := flag.String("token", "", "scrcpy daemon token; overrides DAEMON_TOKEN")
+	flagExpectedWidth := flag.Int("expected-width", -1, "expected virtual display width; overrides EXPECTED_WIDTH")
+	flagExpectedHeight := flag.Int("expected-height", -1, "expected virtual display height; overrides EXPECTED_HEIGHT")
+	flagCursorURL := flag.String("cursor-url", "", "cursor JSON endpoint; overrides CURSOR_URL")
+	flag.Parse()
+
 	daemonAddr := getenv("DAEMON_ADDR", "127.0.0.1:27183")
+	if *flagDaemon != "" {
+		daemonAddr = *flagDaemon
+	}
 	token := os.Getenv("DAEMON_TOKEN")
-	displayID, err := strconv.Atoi(getenv("DISPLAY_ID", "0"))
-	if err != nil || displayID < 0 {
-		log.Fatalf("invalid DISPLAY_ID=%q", getenv("DISPLAY_ID", "0"))
+	if *flagToken != "" {
+		token = *flagToken
+	}
+	displayID := -1
+	if *flagDisplayID >= 0 {
+		displayID = *flagDisplayID
+	} else if displayEnv := strings.TrimSpace(os.Getenv("DISPLAY_ID")); displayEnv != "" {
+		var err error
+		displayID, err = strconv.Atoi(displayEnv)
+		if err != nil || displayID < 0 {
+			log.Fatalf("invalid DISPLAY_ID=%q", displayEnv)
+		}
+	} else if *testMode {
+		// Explicit test mode may intentionally bind the daemon's default display.
+		displayID = 0
+	} else {
+		log.Fatalf("DISPLAY_ID is required; use -t only for direct test startup or set DISPLAY_ID explicitly")
 	}
 	expectedWidth, _ := strconv.Atoi(getenv("EXPECTED_WIDTH", "0"))
 	expectedHeight, _ := strconv.Atoi(getenv("EXPECTED_HEIGHT", "0"))
+	if *flagExpectedWidth >= 0 {
+		expectedWidth = *flagExpectedWidth
+	}
+	if *flagExpectedHeight >= 0 {
+		expectedHeight = *flagExpectedHeight
+	}
 	listen := getenv("LISTEN", ":19000")
+	if *flagListen != "" {
+		listen = *flagListen
+	}
 	cursorURL := os.Getenv("CURSOR_URL")
+	if *flagCursorURL != "" {
+		cursorURL = *flagCursorURL
+	}
 
 	source := newH264Source(daemonAddr, token, displayID, expectedWidth, expectedHeight)
 	go source.run()
@@ -571,12 +614,14 @@ func (s *h264Source) waitProfile(timeout time.Duration) string {
 }
 
 func newH264Source(addr, token string, displayID, expectedWidth, expectedHeight int) *h264Source {
+	h := streamHeader{Width: expectedWidth, Height: expectedHeight}
 	return &h264Source{
 		addr:           addr,
 		token:          token,
 		displayID:      displayID,
 		expectedWidth:  expectedWidth,
 		expectedHeight: expectedHeight,
+		header:         h,
 		changed:        make(chan struct{}),
 	}
 }
@@ -675,7 +720,7 @@ func (s *h264Source) ensureSession() error {
 		"video=true",
 		"audio=false",
 		"video_codec=h264",
-		"send_stream_meta=true",
+		"send_stream_meta=false",
 		"send_frame_meta=true",
 	}, "\n") + "\n"
 
@@ -768,46 +813,104 @@ func (s *h264Source) readScrcpyVideoStream(conn net.Conn) error {
 		return fmt.Errorf("internal video connection type error")
 	}
 
-	codecID, err := readI32(bc.r)
-	if err != nil {
-		return err
-	}
-	if uint32(codecID) != codecH264ID {
-		return fmt.Errorf("unsupported scrcpy video codec id=0x%08x (want H264=0x%08x)", uint32(codecID), codecH264ID)
+	// The daemon's FrameBroadcaster is shared per display. If another client
+	// (notably the Android app itself) created it first, its original
+	// send_stream_meta=false setting is baked into the broadcaster. In that
+	// case the ROLE_VIDEO socket starts directly with FrameMeta, without a
+	// codec-id or SessionMeta. Our gateway therefore accepts BOTH forms:
+	//
+	//   A) codec header + optional SessionMeta + FrameMeta
+	//   B) FrameMeta-only (the normal path for the app's existing subscriber)
+	//
+	// We prefer B for newly-created broadcasters by requesting
+	// send_stream_meta=false in ensureSession().
+	hasCodecHeader := false
+	codec := uint32(codecH264ID)
+	if peek, e := bc.r.Peek(12); e == nil {
+		first := binary.BigEndian.Uint32(peek[0:4])
+		second := binary.BigEndian.Uint32(peek[4:8])
+		sz := int64(int32(binary.BigEndian.Uint32(peek[8:12])))
+		looksLikeCodec := first == codecH264ID
+		if first == codecH264LegacyID {
+			// Legacy/internal H264 is also the high 32 bits of the KEY_FRAME
+			// flag, so distinguish a real codec header from a frame-meta-only
+			// stream by looking for a following meta/flag word or an implausibly
+			// large PTS high-half.
+			looksLikeCodec = (second&0xC0000000) != 0 || second > 0x00FFFFFF
+		}
+		if looksLikeCodec {
+			_, _ = io.ReadFull(bc.r, peek[0:4])
+			codecID, e := readI32From4(peek[0:4])
+			if e != nil {
+				return e
+			}
+			codec = uint32(codecID)
+			if codec != codecH264ID && codec != codecH264LegacyID {
+				return fmt.Errorf("unsupported scrcpy video codec id=0x%08x (want H264=0x%08x or legacy=0x%08x)", codec, codecH264ID, codecH264LegacyID)
+			}
+			hasCodecHeader = true
+			if codec == codecH264LegacyID {
+				log.Printf("scrcpy ROLE_VIDEO reports legacy/internal H264 codec id=0x%08x", codec)
+			}
+		} else if first == codecH264LegacyID && sz >= 1 && sz <= maxFramePayload {
+			log.Printf("scrcpy ROLE_VIDEO detected frame-meta-only legacy-keyframe stream (displayId=%d)", s.displayID)
+		}
 	}
 
-	sessionFlags, err := readU32(bc.r)
-	if err != nil {
-		return err
-	}
-	width, err := readI32(bc.r)
-	if err != nil {
-		return err
-	}
-	height, err := readI32(bc.r)
-	if err != nil {
-		return err
-	}
-	if sessionFlags&packetFlagSession == 0 {
-		return fmt.Errorf("invalid scrcpy session metadata flags=0x%08x", sessionFlags)
-	}
-
-	s.mu.Lock()
-	s.header.Width = int(width)
-	s.header.Height = int(height)
-	s.mu.Unlock()
-	log.Printf("scrcpy ROLE_VIDEO connected: displayId=%d codec=H264 %dx%d sessionFlags=0x%08x",
-		s.displayID, width, height, sessionFlags)
+	log.Printf("scrcpy ROLE_VIDEO connected: displayId=%d codec=H264 framing=%s", s.displayID, func() string {
+		if hasCodecHeader {
+			return "codec-header"
+		}
+		return "frame-meta-only"
+	}())
 
 	for {
-		rawFlags, err := readU64(bc.r)
-		if err != nil {
+		// scrcpy Streamer multiplexes two different 12-byte records:
+		//   1) SessionMeta: uint32(flags) | uint32(width) | uint32(height)
+		//      with bit31 of flags set; NO payload follows.
+		//   2) FrameMeta: uint64(ptsAndFlags) | uint32(payloadSize),
+		//      followed by payload bytes.
+		// Read the first 4 bytes first so SessionMeta can be recognized without
+		// consuming the following frame header as a gigantic payload size.
+		var first4 [4]byte
+		if _, err := io.ReadFull(bc.r, first4[:]); err != nil {
 			return err
 		}
-		size, err := readI32(bc.r)
-		if err != nil {
+
+		first := binary.BigEndian.Uint32(first4[:])
+		if hasCodecHeader && first&0x80000000 != 0 {
+			var metaRest [8]byte
+			if _, err := io.ReadFull(bc.r, metaRest[:]); err != nil {
+				return err
+			}
+			width := binary.BigEndian.Uint32(metaRest[0:4])
+			height := binary.BigEndian.Uint32(metaRest[4:8])
+			s.mu.Lock()
+			s.header.Width = int(width)
+			s.header.Height = int(height)
+			s.mu.Unlock()
+			log.Printf("scrcpy ROLE_VIDEO session meta: displayId=%d %dx%d flags=0x%08x", s.displayID, width, height, first)
+			continue
+		}
+
+		// FrameMeta is exactly 12 bytes total: uint64 ptsAndFlags + uint32 payloadSize.
+		// We already consumed the first 4 bytes above, so consume only the remaining
+		// 4 bytes of ptsAndFlags, then the 4-byte payload size. The previous version
+		// consumed 8 bytes here and therefore swallowed the first 4 bytes of the H264
+		// payload (for example 67 42 00 0a), producing the bogus size 0x6742000a.
+		var ptsLow4 [4]byte
+		if _, err := io.ReadFull(bc.r, ptsLow4[:]); err != nil {
 			return err
 		}
+		var ptsBytes [8]byte
+		copy(ptsBytes[0:4], first4[:])
+		copy(ptsBytes[4:8], ptsLow4[:])
+		rawFlags := binary.BigEndian.Uint64(ptsBytes[:])
+		var size4 [4]byte
+		if _, err := io.ReadFull(bc.r, size4[:]); err != nil {
+			return err
+		}
+		size := int32(binary.BigEndian.Uint32(size4[:]))
 		if size <= 0 || size > maxFramePayload {
 			return fmt.Errorf("invalid scrcpy frame size=%d", size)
 		}
@@ -1052,6 +1155,13 @@ func readU8(r io.Reader) (byte, error) {
 	var b [1]byte
 	_, err := io.ReadFull(r, b[:])
 	return b[0], err
+}
+
+func readI32From4(b []byte) (int32, error) {
+	if len(b) != 4 {
+		return 0, fmt.Errorf("expected exactly 4 bytes, got %d", len(b))
+	}
+	return int32(binary.BigEndian.Uint32(b)), nil
 }
 
 func readI32(r io.Reader) (int32, error) {

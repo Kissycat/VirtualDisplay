@@ -43,9 +43,9 @@ class DisplayControlPanel(
 
     private fun resetCollapseTimer() {
         handler?.removeCallbacks(collapseRunnable)
-        if (!isCollapsed && !isDragging) {
-            handler?.postDelayed(collapseRunnable, 3000)
-        }
+//        if (!isCollapsed && !isDragging) {
+//            handler?.postDelayed(collapseRunnable, 3000)
+//        }
     }
 
     private fun stopCollapseTimer() {

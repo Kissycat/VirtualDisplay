@@ -37,7 +37,13 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
 
     @Volatile private var pid: Int = -1
 
-    fun isRunning(): Boolean = isPortOpen(DEFAULT_GATEWAY_PORT)
+    fun isRunning(): Boolean {
+        // The gateway is a privileged process. Determine its lifecycle from the
+        // privileged PID/process table first, and use the localhost TCP probe only
+        // as a fallback. This keeps the UI state independent from the app's UID.
+        return runCatching { remoteGatewayProcessAlive() }.getOrDefault(false) ||
+            isPortOpen(DEFAULT_GATEWAY_PORT)
+    }
 
     /** Starts the bundled gateway and makes it consume the existing scrcpy daemon stream. */
     @Synchronized
@@ -100,10 +106,22 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
                     val log = readGatewayLog().take(4096)
                     throw IOException("Gateway did not open port $gatewayPort${if (log.isBlank()) "" else ": $log"}")
                 }
+                // A listening gateway is a successful process start. Do not turn a
+                // temporary/no-frame condition into a failed start: the scrcpy
+                // subscriber can become ready slightly later, especially when another
+                // local subscriber already owns the shared encoder.
+                val sourceReady = waitForGatewaySourceReady(gatewayPort, displayId, 3_000L)
+                if (!sourceReady) {
+                    Log.w(
+                        TAG,
+                        "Gateway is running but source display=$displayId is not ready yet; " +
+                            "continuing startup. Recent gateway log: ${readGatewayLog().take(2048)}"
+                    )
+                }
                 Log.i(
                     TAG,
                     "Gateway launched: daemon=$daemonAddr displayId=$displayId " +
-                        "size=${expectedWidth}x${expectedHeight} gatewayPort=$gatewayPort"
+                        "size=${expectedWidth}x${expectedHeight} gatewayPort=$gatewayPort sourceReady=$sourceReady"
                 )
             }
 
@@ -208,15 +226,65 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         }
     }
 
-    private fun stopRemoteGateway() {
-        runCatching {
-            val p = pid
-            val cmd = if (p > 0) {
-                "kill -TERM $p 2>/dev/null || true; sleep 0.2; kill -KILL $p 2>/dev/null || true; rm -f '$PID_PATH'"
-            } else {
-                "if [ -f '$PID_PATH' ]; then p=\$(cat '$PID_PATH' 2>/dev/null || true); kill -TERM \$p 2>/dev/null || true; sleep 0.2; kill -KILL \$p 2>/dev/null || true; fi; rm -f '$PID_PATH'"
+private fun stopRemoteGateway() {
+    runCatching {
+        val localPid = pid
+        val killCmd = buildString {
+            if (localPid > 0) {
+                append("kill -9 $localPid 2>/dev/null; ")
             }
-            runPrivilegedShell(cmd)
+            append("pkill -9 -f '$BINARY_NAME' 2>/dev/null; ")
+            append("rm -f '$PID_PATH' '$LOG_PATH' 2>/dev/null")
+        }
+
+        // 直接调用 executePrivileged
+        val proc = executePrivileged(arrayOf("sh", "-c", killCmd))
+        if (proc != null) {
+            try {
+                // 读取流会阻塞等待 Shell 执行完闭合，保证 kill 命令能完整运行
+                val stdout = proc.inputStream.bufferedReader().readText()
+                val stderr = proc.errorStream.bufferedReader().readText()
+                proc.waitFor(2, TimeUnit.SECONDS)
+                Log.i(TAG, "Stop command finished. stdout='$stdout', stderr='$stderr'")
+            } finally {
+                runCatching { proc.destroy() }
+                runCatching { proc.inputStream.close() }
+                runCatching { proc.errorStream.close() }
+            }
+        }
+
+        // 验证进程和端口是否已清除
+        val deadline = System.currentTimeMillis() + 2500L
+        while (System.currentTimeMillis() < deadline &&
+            (remoteGatewayProcessAlive() || isPortOpen(DEFAULT_GATEWAY_PORT))) {
+            Thread.sleep(100)
+        }
+        if (remoteGatewayProcessAlive() || isPortOpen(DEFAULT_GATEWAY_PORT)) {
+            Log.w(TAG, "Gateway is still alive after stop attempt; recordedPid=$localPid")
+        } else {
+            Log.i(TAG, "Gateway stopped successfully; recordedPid=$localPid")
+        }
+    }.onFailure { Log.e(TAG, "Gateway stop failed", it) }
+}
+
+    private fun remoteGatewayProcessAlive(): Boolean {
+        val proc = executePrivileged(arrayOf("sh", "-c",
+            "found=0; " +
+                "p=\$(cat '$PID_PATH' 2>/dev/null || true); " +
+                "case \"\$p\" in ''|*[!0-9]*) ;; *) kill -0 \"\$p\" 2>/dev/null && found=1 ;; esac; " +
+                "if [ \"\$found\" -eq 0 ]; then " +
+                "  for x in \$(pidof '$BINARY_NAME' 2>/dev/null || true); do " +
+                "    kill -0 \"\$x\" 2>/dev/null && found=1 && break; " +
+                "  done; " +
+                "fi; " +
+                "[ \"\$found\" -eq 1 ]"
+        )) ?: return false
+        return try {
+            proc.waitFor(800, TimeUnit.MILLISECONDS) && proc.exitValue() == 0
+        } catch (_: Throwable) {
+            false
+        } finally {
+            runCatching { proc.destroy() }
         }
     }
 
@@ -279,17 +347,19 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
 
     private fun readGatewayDisplayId(port: Int): Int? {
         return runCatching {
-            val url = URL("http://127.0.0.1:$port/debug/status")
-            val connection = url.openConnection() as java.net.HttpURLConnection
-            connection.connectTimeout = 500
-            connection.readTimeout = 700
-            connection.requestMethod = "GET"
-            connection.inputStream.bufferedReader().use { it.readText() }
-                .let { body ->
-                    Regex("\\\"displayId\\\"\\s*:\\s*(-?\\d+)").find(body)
-                        ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                }
-                .also { connection.disconnect() }
+            val connection = (URL("http://127.0.0.1:$port/debug/status").openConnection() as java.net.HttpURLConnection).apply {
+                connectTimeout = 500
+                readTimeout = 700
+                requestMethod = "GET"
+            }
+            try {
+                val body = connection.inputStream.bufferedReader().use { it.readText() }
+                val root = org.json.JSONObject(body)
+                val source = root.optJSONObject("source") ?: root
+                source.optInt("displayId", Int.MIN_VALUE).takeUnless { it == Int.MIN_VALUE }
+            } finally {
+                connection.disconnect()
+            }
         }.getOrNull()
     }
 
@@ -297,6 +367,44 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         Socket().use { it.connect(InetSocketAddress(host, port), PROBE_TIMEOUT_MS) }
         true
     } catch (_: Throwable) { false }
+
+
+    private fun waitForGatewaySourceReady(port: Int, displayId: Int, timeoutMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val status = runCatching {
+                val connection = (URL("http://127.0.0.1:$port/debug/status").openConnection() as java.net.HttpURLConnection).apply {
+                    connectTimeout = 400
+                    readTimeout = 700
+                    requestMethod = "GET"
+                }
+                try {
+                    connection.inputStream.bufferedReader().use { it.readText() }
+                } finally {
+                    connection.disconnect()
+                }
+            }.getOrNull()
+            if (status != null) {
+                runCatching {
+                    val root = org.json.JSONObject(status)
+                    // Gateway /debug/status wraps source state under { "source": {...} }.
+                    // The previous version incorrectly read these fields from the root,
+                    // causing a healthy gateway to be reported as "no video frames".
+                    val json = root.optJSONObject("source") ?: root
+                    val actualDisplay = json.optInt("displayId", -1)
+                    val connected = json.optBoolean("connected", false)
+                    val frames = json.optLong("frames", 0L)
+                    val width = json.optInt("width", 0)
+                    val height = json.optInt("height", 0)
+                    if (actualDisplay == displayId && connected && frames > 0 && width > 0 && height > 0) {
+                        return true
+                    }
+                }
+            }
+            Thread.sleep(150)
+        }
+        return false
+    }
 
     private fun waitForPort(host: String, port: Int, timeoutMs: Long): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs

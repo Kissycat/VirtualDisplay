@@ -2,7 +2,7 @@
 
 This companion gateway keeps the Android app on the zero-reencode path:
 
-Browser WebRTC <-> Pion gateway <-> TCP VDH1 H.264 <-> Android MediaCodec encoder
+Browser WebRTC <-> Pion gateway <-> scrcpy daemon ROLE_VIDEO <-> Android MediaCodec encoder
 
 ## Build
 
@@ -11,10 +11,14 @@ go mod tidy
 go build -o virtualdisplay-webrtc-gateway .
 ```
 
-For Android as the H.264 source:
+The gateway is a scrcpy daemon client. It requires an explicit virtual display id:
 
 ```bash
-ANDROID_H264=192.168.1.50:18080 LISTEN=:19000 ./virtualdisplay-webrtc-gateway
+DAEMON_ADDR=127.0.0.1:27183 \
+DAEMON_TOKEN=your-token \
+DISPLAY_ID=3 \
+LISTEN=:19000 \
+./virtualdisplay-webrtc-gateway
 ```
 
 Open:
