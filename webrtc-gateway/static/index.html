@@ -1,3 +1,153 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VirtualDisplay WebRTC</title><style>html,body{margin:0;height:100%;background:#111}video{width:100%;height:100%;object-fit:contain;background:#000}</style></head><body><video id="v" autoplay playsinline controls></video><script>
-(async()=>{const v=document.getElementById('v');const pc=new RTCPeerConnection({iceServers:[]});pc.addTransceiver('video',{direction:'recvonly'});pc.ontrack=e=>v.srcObject=e.streams[0];const offer=await pc.createOffer();await pc.setLocalDescription(offer);if(pc.iceGatheringState!=='complete')await new Promise(r=>pc.addEventListener('icegatheringstatechange',()=>pc.iceGatheringState==='complete'&&r(),{once:true}));const r=await fetch('/offer',{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});if(!r.ok)throw new Error(await r.text());await pc.setRemoteDescription({type:'answer',sdp:await r.text()})})().catch(e=>document.body.insertAdjacentHTML('beforeend','<pre style="color:#f66">'+e+'</pre>'));
-</script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VirtualDisplay WebRTC</title>
+<style>
+html,body{margin:0;width:100%;height:100%;background:#111;color:#ddd;font-family:system-ui,sans-serif;overflow:hidden}
+body{display:flex;flex-direction:column}
+#bar{height:38px;display:flex;align-items:center;gap:12px;padding:0 12px;background:#202020;box-sizing:border-box;font-size:13px}
+#status{color:#9ad}
+button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:5px 10px;cursor:pointer}
+#wrap{position:relative;flex:1;min-height:0;overflow:hidden;background:#000}
+#video{position:absolute;left:50%;top:50%;display:block;background:#000;object-fit:fill;transform:translate(-50%,-50%);transform-origin:center center}
+#cursor{position:absolute;width:0;height:0;pointer-events:none;z-index:20;display:none;filter:drop-shadow(0 1px 1px rgba(0,0,0,.9))}
+#cursor::before{content:"";position:absolute;left:0;top:0;width:0;height:0;border-top:15px solid #fff;border-right:8px solid transparent;transform:rotate(-8deg)}
+#cursor::after{content:"";position:absolute;left:2px;top:3px;width:0;height:0;border-top:10px solid #111;border-right:5px solid transparent;transform:rotate(-8deg)}
+</style>
+</head>
+<body>
+<div id="bar"><span>VirtualDisplay WebRTC</span><span id="status">connecting...</span><button id="reconnect">Reconnect</button></div>
+<div id="wrap"><video id="video" autoplay playsinline muted></video><div id="cursor"></div></div>
+<script>
+const video=document.getElementById('video');
+const wrap=document.getElementById('wrap');
+const cursor=document.getElementById('cursor');
+const status=document.getElementById('status');
+let pc=null;
+let expectedW=0, expectedH=0;
+let sourceW=0, sourceH=0;
+let rotated=false;
+
+function setStatus(s){status.textContent=s;console.log('[WebRTC]',s);}
+
+function fitRect(aspect,w,h){
+  if(!aspect || w<=0 || h<=0) return {w:0,h:0};
+  let tw=w, th=Math.round(w/aspect);
+  if(th>h){th=h;tw=Math.round(h*aspect);}
+  return {w:tw,h:th};
+}
+
+function applyVideoLayout(){
+  const w=wrap.clientWidth, h=wrap.clientHeight;
+  if(w<=0 || h<=0) return;
+
+  const logicalW=expectedW||sourceW||video.videoWidth;
+  const logicalH=expectedH||sourceH||video.videoHeight;
+  if(logicalW<=0 || logicalH<=0) return;
+
+  const srcW=sourceW||video.videoWidth;
+  const srcH=sourceH||video.videoHeight;
+  rotated = expectedW>0 && expectedH>0 && srcW>0 && srcH>0 &&
+            ((expectedW>expectedH)!=(srcW>srcH));
+
+  const r=fitRect(logicalW/logicalH,w,h);
+  if(r.w<=0 || r.h<=0) return;
+
+  if(rotated){
+    // The decoder produces portrait-coded H264 while the selected virtual
+    // display is landscape. Lay out the pre-rotation buffer with swapped
+    // dimensions, then rotate it in the browser so the displayed rectangle
+    // is still exactly the virtual display's logical aspect ratio.
+    video.style.width=r.h+'px';
+    video.style.height=r.w+'px';
+    video.style.transform='translate(-50%,-50%) rotate(90deg)';
+  }else{
+    video.style.width=r.w+'px';
+    video.style.height=r.h+'px';
+    video.style.transform='translate(-50%,-50%)';
+  }
+}
+
+function updateCursor(c){
+  if(!c || !c.visible || !c.width || !c.height || !video.videoWidth || !video.videoHeight){
+    cursor.style.display='none'; return;
+  }
+  const vr=video.getBoundingClientRect(), wr=wrap.getBoundingClientRect();
+  if(vr.width<=0||vr.height<=0){cursor.style.display='none';return;}
+  // Browser cursor is optional; local Android uses its own overlay. For the
+  // Web page, map against the rotated visual rectangle rather than raw buffer.
+  let nx=c.x/c.width, ny=c.y/c.height;
+  if(rotated){
+    const tx=nx, ty=ny;
+    nx=1-ty; ny=tx;
+  }
+  cursor.style.left=(vr.left-wr.left+nx*vr.width)+'px';
+  cursor.style.top=(vr.top-wr.top+ny*vr.height)+'px';
+  cursor.style.display='block';
+}
+
+async function refreshStatus(){
+  try{
+    const r=await fetch('/debug/status',{cache:'no-store'});
+    if(!r.ok)return;
+    const s=await r.json();
+    expectedW=Number(s.source?.expectedWidth||0);
+    expectedH=Number(s.source?.expectedHeight||0);
+    sourceW=Number(s.source?.width||0);
+    sourceH=Number(s.source?.height||0);
+    applyVideoLayout();
+  }catch(e){}
+}
+
+async function pollCursor(){
+  try{const r=await fetch('/cursor',{cache:'no-store'});if(r.ok)updateCursor(await r.json());}
+  catch(e){}
+  requestAnimationFrame(()=>setTimeout(pollCursor,33));
+}
+
+async function start(){
+  if(pc){try{pc.close()}catch(e){}pc=null;}
+  setStatus('creating peer...');
+  pc=new RTCPeerConnection({iceServers:[]});
+  pc.addTransceiver('video',{direction:'recvonly'});
+  pc.ontrack=e=>{
+    video.srcObject=(e.streams&&e.streams[0])?e.streams[0]:new MediaStream([e.track]);
+    video.play().catch(()=>{});
+    applyVideoLayout();
+  };
+  video.onloadedmetadata=()=>{
+    sourceW=video.videoWidth; sourceH=video.videoHeight;
+    applyVideoLayout();
+  };
+  pc.oniceconnectionstatechange=()=>setStatus('ICE: '+pc.iceConnectionState);
+  pc.onconnectionstatechange=()=>setStatus('PC: '+pc.connectionState);
+  try{
+    await refreshStatus();
+    const offer=await pc.createOffer({offerToReceiveVideo:true});
+    await pc.setLocalDescription(offer);
+    await new Promise(resolve=>{
+      if(pc.iceGatheringState==='complete')return resolve();
+      const timer=setTimeout(resolve,5000);
+      pc.onicegatheringstatechange=()=>{
+        if(pc.iceGatheringState==='complete'){clearTimeout(timer);resolve();}
+      };
+    });
+    const res=await fetch('/offer',{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
+    if(!res.ok)throw new Error('HTTP '+res.status+' '+await res.text());
+    await pc.setRemoteDescription({type:'answer',sdp:await res.text()});
+    await refreshStatus();
+    setStatus('connected');
+    setTimeout(applyVideoLayout,100);
+  }catch(e){
+    console.error('[WebRTC]',e);setStatus('error: '+e.message);
+    if(pc){try{pc.close()}catch(_){}pc=null;}
+  }
+}
+window.addEventListener('resize',applyVideoLayout);
+document.getElementById('reconnect').onclick=start;
+start(); pollCursor(); setInterval(refreshStatus,1000);
+</script>
+</body>
+</html>

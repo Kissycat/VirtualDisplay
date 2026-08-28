@@ -16,10 +16,8 @@ import java.util.concurrent.TimeUnit
 /**
  * Starts the bundled WebRTC gateway through Shizuku/root from /data/local/tmp.
  *
- * The H.264 endpoint is started directly by the Android app before this gateway
- * is launched. The gateway only consumes that already-running endpoint.
- * The HTTP /api/webrtc/start route remains available for external debugging,
- * but is intentionally not used by the in-app startup path.
+ * The gateway connects directly to the running scrcpy daemon using its
+ * ROLE_NEGOTIATION + ROLE_VIDEO protocol. No second H.264 endpoint is created.
  *
  * We never use Process.waitFor()/exitValue() for the long-running gateway.
  * Shizuku Process wrappers are not a reliable lifecycle source for a daemon.
@@ -29,7 +27,6 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         private const val TAG = "GatewayProcessController"
         private const val BINARY_NAME = "virtualdisplay-webrtc-gateway"
         private const val REMOTE_PATH = "/data/local/tmp/$BINARY_NAME"
-        const val DEFAULT_H264_PORT = 18080
         const val DEFAULT_GATEWAY_PORT = 19000
         const val DEFAULT_CONTROL_PORT = 18081
         private const val LOG_PATH = "/data/local/tmp/virtualdisplay-webrtc-gateway.log"
@@ -42,13 +39,14 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
 
     fun isRunning(): Boolean = isPortOpen(DEFAULT_GATEWAY_PORT)
 
-    /** Starts gateway + H264 stream for the requested virtual display. */
+    /** Starts the bundled gateway and makes it consume the existing scrcpy daemon stream. */
     @Synchronized
     fun start(
         displayId: Int,
-        h264Port: Int = DEFAULT_H264_PORT,
         gatewayPort: Int = DEFAULT_GATEWAY_PORT,
-        bindHost: String = "0.0.0.0"
+        bindHost: String = "0.0.0.0",
+        expectedWidth: Int = 0,
+        expectedHeight: Int = 0,
     ): Result<String> {
         if (displayId < 0) return Result.failure(IllegalArgumentException("Invalid displayId=$displayId"))
 
@@ -63,24 +61,57 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         }
 
         return runCatching {
-            // If an old gateway is already listening, reuse it and simply bind the
-            // requested display to the H264 endpoint.
+            // Never reuse a gateway that is attached to another display. The
+            // gateway owns one scrcpy ROLE_VIDEO stream, so reusing it is exactly
+            // how a previous physical-screen stream can leak into the new display.
+            if (isPortOpen(gatewayPort)) {
+                val existingDisplay = readGatewayDisplayId(gatewayPort)
+                if (existingDisplay == null || existingDisplay != displayId) {
+                    Log.i(
+                        TAG,
+                        "Gateway port $gatewayPort belongs to display=$existingDisplay; " +
+                            "requested display=$displayId, restarting gateway"
+                    )
+                    stop()
+                } else {
+                    Log.i(TAG, "Reusing gateway already attached to display=$displayId")
+                }
+            }
+
             if (!isPortOpen(gatewayPort)) {
                 installBinary()
-                launchGateway(h264Port, gatewayPort)
+
+                val node = AppSettings.getCurrentServerNodeSync()
+                val daemonHost = when {
+                    node.host == "0.0.0.0" || node.host == "localhost" -> "127.0.0.1"
+                    else -> node.host
+                }
+                val daemonAddr = "$daemonHost:${node.port}"
+
+                launchGateway(
+                    daemonAddr = daemonAddr,
+                    daemonToken = node.password,
+                    displayId = displayId,
+                    gatewayPort = gatewayPort,
+                    expectedWidth = expectedWidth,
+                    expectedHeight = expectedHeight,
+                )
                 if (!waitForPort("127.0.0.1", gatewayPort, START_TIMEOUT_MS)) {
                     val log = readGatewayLog().take(4096)
                     throw IOException("Gateway did not open port $gatewayPort${if (log.isBlank()) "" else ": $log"}")
                 }
+                Log.i(
+                    TAG,
+                    "Gateway launched: daemon=$daemonAddr displayId=$displayId " +
+                        "size=${expectedWidth}x${expectedHeight} gatewayPort=$gatewayPort"
+                )
             }
 
-            Log.i(TAG, "WebRTC gateway started; H264 endpoint is managed by the app. displayId=$displayId h264Port=$h264Port gatewayPort=$gatewayPort")
             browserUrl(gatewayPort)
         }
     }
 
-    /** Stops only the bundled gateway process. The APK-owned H.264 endpoint is stopped
-     * directly by the repository; the debug HTTP API is never used for in-app shutdown. */
+    /** Stops only the bundled WebRTC gateway process. */
     @Synchronized
     fun stop() {
         stopRemoteGateway()
@@ -140,12 +171,23 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         }
     }
 
-    private fun launchGateway(h264Port: Int, gatewayPort: Int) {
+    private fun launchGateway(
+        daemonAddr: String,
+        daemonToken: String,
+        displayId: Int,
+        gatewayPort: Int,
+        expectedWidth: Int,
+        expectedHeight: Int,
+    ) {
         val command = buildString {
             append("rm -f '").append(PID_PATH).append("'; ")
-            append("export ANDROID_H264='127.0.0.1:").append(h264Port).append("'; ")
-            append("export ANDROID_CONTROL='127.0.0.1:").append(DEFAULT_CONTROL_PORT).append("'; ")
+            append("export DAEMON_ADDR=").append(quoteShell(daemonAddr)).append("; ")
+            append("export DAEMON_TOKEN=").append(quoteShell(daemonToken)).append("; ")
+            append("export DISPLAY_ID='").append(displayId).append("'; ")
+            append("export EXPECTED_WIDTH='").append(expectedWidth).append("'; ")
+            append("export EXPECTED_HEIGHT='").append(expectedHeight).append("'; ")
             append("export LISTEN='0.0.0.0:").append(gatewayPort).append("'; ")
+            append("export CURSOR_URL='http://127.0.0.1:").append(DEFAULT_CONTROL_PORT).append("/api/webrtc/cursor'; ")
             append("nohup '").append(REMOTE_PATH).append("' </dev/null >'").append(LOG_PATH).append("' 2>&1 & ")
             append("echo \$! > '").append(PID_PATH).append("'; ")
             append("sleep 0.2; cat '").append(PID_PATH).append("' 2>/dev/null || true")
@@ -233,6 +275,22 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
     }.getOrElse {
         Log.e(TAG, "Shizuku newProcess failed", it)
         null
+    }
+
+    private fun readGatewayDisplayId(port: Int): Int? {
+        return runCatching {
+            val url = URL("http://127.0.0.1:$port/debug/status")
+            val connection = url.openConnection() as java.net.HttpURLConnection
+            connection.connectTimeout = 500
+            connection.readTimeout = 700
+            connection.requestMethod = "GET"
+            connection.inputStream.bufferedReader().use { it.readText() }
+                .let { body ->
+                    Regex("\\\"displayId\\\"\\s*:\\s*(-?\\d+)").find(body)
+                        ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                }
+                .also { connection.disconnect() }
+        }.getOrNull()
     }
 
     private fun isPortOpen(port: Int, host: String = "127.0.0.1"): Boolean = try {

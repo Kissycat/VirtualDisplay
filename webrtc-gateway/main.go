@@ -11,8 +11,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -20,15 +23,33 @@ import (
 )
 
 const (
-	magic                     = "VDH1"
-	typeFormat                = 1
-	typeFrame                 = 2
-	flagConfig                = 1
-	flagKeyFrame              = 2
-	defaultH264ProfileLevelID = "42e032" // Baseline, Level 5.0
+	// Built-in scrcpy daemon socket roles.
+	roleVideo       = 0
+	roleAudio       = 1
+	roleControl     = 2
+	roleNegotiation = 3
+
+	// Current daemon protocol message.
+	typeConfigureSession = 216
+	typeGenericResponse  = 100
+
+	// 4-byte codec id used by com.genymobile.scrcpy.video.VideoCodec.H264.
+	codecH264ID = 0x68323634
+
+	// Streamer packet flags.
+	packetFlagSession  uint32 = 1 << 31
+	packetFlagConfig   uint64 = 1 << 62
+	packetFlagKeyFrame uint64 = 1 << 61
+
+	flagConfig   = 1 << 0
+	flagKeyFrame = 1 << 1
+
+	defaultH264ProfileLevelID = "42e032"
 	frameHistoryWindow        = 4 * time.Second
 	frameHistoryMaxFrames     = 600
+	maxFramePayload           = 32 * 1024 * 1024
 )
+
 const browserHTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -41,8 +62,8 @@ body{display:flex;flex-direction:column}
 #bar{height:38px;display:flex;align-items:center;gap:12px;padding:0 12px;background:#202020;box-sizing:border-box;font-size:13px}
 #status{color:#9ad}
 button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:5px 10px;cursor:pointer}
-#wrap{position:relative;flex:1;display:flex;align-items:center;justify-content:center;min-height:0;overflow:hidden}
-video{max-width:100%;max-height:100%;width:auto;height:auto;background:#000;object-fit:contain}
+#wrap{position:relative;flex:1;min-height:0;overflow:hidden;background:#000}
+#video{position:absolute;left:50%;top:50%;display:block;background:#000;object-fit:fill;transform:translate(-50%,-50%);transform-origin:center center}
 #cursor{position:absolute;width:0;height:0;pointer-events:none;z-index:20;display:none;filter:drop-shadow(0 1px 1px rgba(0,0,0,.9))}
 #cursor::before{content:"";position:absolute;left:0;top:0;width:0;height:0;border-top:15px solid #fff;border-right:8px solid transparent;transform:rotate(-8deg)}
 #cursor::after{content:"";position:absolute;left:2px;top:3px;width:0;height:0;border-top:10px solid #111;border-right:5px solid transparent;transform:rotate(-8deg)}
@@ -57,52 +78,137 @@ const wrap=document.getElementById('wrap');
 const cursor=document.getElementById('cursor');
 const status=document.getElementById('status');
 let pc=null;
-function setStatus(s){ status.textContent=s; console.log('[WebRTC]',s); }
+let expectedW=0, expectedH=0;
+let sourceW=0, sourceH=0;
+let rotated=false;
+
+function setStatus(s){status.textContent=s;console.log('[WebRTC]',s);}
+
+function fitRect(aspect,w,h){
+  if(!aspect || w<=0 || h<=0) return {w:0,h:0};
+  let tw=w, th=Math.round(w/aspect);
+  if(th>h){th=h;tw=Math.round(h*aspect);}
+  return {w:tw,h:th};
+}
+
+function applyVideoLayout(){
+  const w=wrap.clientWidth, h=wrap.clientHeight;
+  if(w<=0 || h<=0) return;
+
+  const logicalW=expectedW||sourceW||video.videoWidth;
+  const logicalH=expectedH||sourceH||video.videoHeight;
+  if(logicalW<=0 || logicalH<=0) return;
+
+  const srcW=sourceW||video.videoWidth;
+  const srcH=sourceH||video.videoHeight;
+  rotated = expectedW>0 && expectedH>0 && srcW>0 && srcH>0 &&
+            ((expectedW>expectedH)!=(srcW>srcH));
+
+  const r=fitRect(logicalW/logicalH,w,h);
+  if(r.w<=0 || r.h<=0) return;
+
+  if(rotated){
+    // The decoder produces portrait-coded H264 while the selected virtual
+    // display is landscape. Lay out the pre-rotation buffer with swapped
+    // dimensions, then rotate it in the browser so the displayed rectangle
+    // is still exactly the virtual display's logical aspect ratio.
+    video.style.width=r.h+'px';
+    video.style.height=r.w+'px';
+    video.style.transform='translate(-50%,-50%) rotate(90deg)';
+  }else{
+    video.style.width=r.w+'px';
+    video.style.height=r.h+'px';
+    video.style.transform='translate(-50%,-50%)';
+  }
+}
+
 function updateCursor(c){
-  if(!c || !c.visible || !c.width || !c.height || !video.videoWidth || !video.videoHeight){cursor.style.display='none';return;}
-  const vr=video.getBoundingClientRect();
-  const wr=wrap.getBoundingClientRect();
-  if(vr.width<=0 || vr.height<=0){cursor.style.display='none';return;}
-  // c.x/c.y are in the 1920x1080 virtual display. Map them to the actual
-  // displayed video rectangle, including object-fit/letterboxing.
-  const px=vr.left-wr.left+(c.x/c.width)*vr.width;
-  const py=vr.top-wr.top+(c.y/c.height)*vr.height;
-  cursor.style.left=px+'px';
-  cursor.style.top=py+'px';
+  if(!c || !c.visible || !c.width || !c.height || !video.videoWidth || !video.videoHeight){
+    cursor.style.display='none'; return;
+  }
+  const vr=video.getBoundingClientRect(), wr=wrap.getBoundingClientRect();
+  if(vr.width<=0||vr.height<=0){cursor.style.display='none';return;}
+  // Browser cursor is optional; local Android uses its own overlay. For the
+  // Web page, map against the rotated visual rectangle rather than raw buffer.
+  let nx=c.x/c.width, ny=c.y/c.height;
+  if(rotated){
+    const tx=nx, ty=ny;
+    nx=1-ty; ny=tx;
+  }
+  cursor.style.left=(vr.left-wr.left+nx*vr.width)+'px';
+  cursor.style.top=(vr.top-wr.top+ny*vr.height)+'px';
   cursor.style.display='block';
 }
+
+async function refreshStatus(){
+  try{
+    const r=await fetch('/debug/status',{cache:'no-store'});
+    if(!r.ok)return;
+    const s=await r.json();
+    expectedW=Number(s.source?.expectedWidth||0);
+    expectedH=Number(s.source?.expectedHeight||0);
+    sourceW=Number(s.source?.width||0);
+    sourceH=Number(s.source?.height||0);
+    applyVideoLayout();
+  }catch(e){}
+}
+
 async function pollCursor(){
   try{const r=await fetch('/cursor',{cache:'no-store'});if(r.ok)updateCursor(await r.json());}
   catch(e){}
   requestAnimationFrame(()=>setTimeout(pollCursor,33));
 }
+
 async function start(){
   if(pc){try{pc.close()}catch(e){}pc=null;}
   setStatus('creating peer...');
   pc=new RTCPeerConnection({iceServers:[]});
   pc.addTransceiver('video',{direction:'recvonly'});
-  pc.ontrack=e=>{video.srcObject=(e.streams&&e.streams[0])?e.streams[0]:new MediaStream([e.track]);video.play().catch(()=>{});};
+  pc.ontrack=e=>{
+    video.srcObject=(e.streams&&e.streams[0])?e.streams[0]:new MediaStream([e.track]);
+    video.play().catch(()=>{});
+    applyVideoLayout();
+  };
+  video.onloadedmetadata=()=>{
+    sourceW=video.videoWidth; sourceH=video.videoHeight;
+    applyVideoLayout();
+  };
   pc.oniceconnectionstatechange=()=>setStatus('ICE: '+pc.iceConnectionState);
   pc.onconnectionstatechange=()=>setStatus('PC: '+pc.connectionState);
   try{
+    await refreshStatus();
     const offer=await pc.createOffer({offerToReceiveVideo:true});
     await pc.setLocalDescription(offer);
-    await new Promise(resolve=>{if(pc.iceGatheringState==='complete')return resolve();const timer=setTimeout(resolve,5000);pc.onicegatheringstatechange=()=>{if(pc.iceGatheringState==='complete'){clearTimeout(timer);resolve();}}});
+    await new Promise(resolve=>{
+      if(pc.iceGatheringState==='complete')return resolve();
+      const timer=setTimeout(resolve,5000);
+      pc.onicegatheringstatechange=()=>{
+        if(pc.iceGatheringState==='complete'){clearTimeout(timer);resolve();}
+      };
+    });
     const res=await fetch('/offer',{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
     if(!res.ok)throw new Error('HTTP '+res.status+' '+await res.text());
     await pc.setRemoteDescription({type:'answer',sdp:await res.text()});
+    await refreshStatus();
     setStatus('connected');
-  }catch(e){console.error('[WebRTC]',e);setStatus('error: '+e.message);if(pc){try{pc.close()}catch(_){}pc=null;}}
+    setTimeout(applyVideoLayout,100);
+  }catch(e){
+    console.error('[WebRTC]',e);setStatus('error: '+e.message);
+    if(pc){try{pc.close()}catch(_){}pc=null;}
+  }
 }
-window.addEventListener('resize',()=>{fetch('/cursor',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(updateCursor).catch(()=>{});});
+window.addEventListener('resize',applyVideoLayout);
 document.getElementById('reconnect').onclick=start;
-start();
-pollCursor();
+start(); pollCursor(); setInterval(refreshStatus,1000);
 </script>
 </body>
 </html>`
 
-type streamHeader struct{ Width, Height int }
+type streamHeader struct {
+	Width  int
+	Height int
+}
+
 type h264Frame struct {
 	seq        uint64
 	ptsUs      int64
@@ -113,7 +219,11 @@ type h264Frame struct {
 
 type h264Source struct {
 	addr           string
-	controlAddr    string
+	token          string
+	displayID      int
+	expectedWidth  int
+	expectedHeight int
+
 	mu             sync.RWMutex
 	header         streamHeader
 	config         []byte
@@ -126,6 +236,15 @@ type h264Source struct {
 	seq            uint64
 	changed        chan struct{}
 	keyRequest     uint64
+
+	// Persistent daemon negotiation socket keeps the server-side session alive.
+	sessionMu sync.Mutex
+	session   net.Conn
+	sessionID int32
+
+	// Current ROLE_VIDEO socket. Protected so diagnostics/recovery can close it safely.
+	videoMu   sync.Mutex
+	videoConn net.Conn
 
 	// Diagnostics / stream state.
 	connected        bool
@@ -150,18 +269,27 @@ type h264Source struct {
 }
 
 func main() {
-	android := getenv("ANDROID_H264", "127.0.0.1:18080")
-	control := getenv("ANDROID_CONTROL", "127.0.0.1:18081")
+	daemonAddr := getenv("DAEMON_ADDR", "127.0.0.1:27183")
+	token := os.Getenv("DAEMON_TOKEN")
+	displayID, err := strconv.Atoi(getenv("DISPLAY_ID", "0"))
+	if err != nil || displayID < 0 {
+		log.Fatalf("invalid DISPLAY_ID=%q", getenv("DISPLAY_ID", "0"))
+	}
+	expectedWidth, _ := strconv.Atoi(getenv("EXPECTED_WIDTH", "0"))
+	expectedHeight, _ := strconv.Atoi(getenv("EXPECTED_HEIGHT", "0"))
 	listen := getenv("LISTEN", ":19000")
+	cursorURL := os.Getenv("CURSOR_URL")
 
-	h264 := newH264Source(android, control)
-	go h264.run()
-	go h264.pollCursor()
+	source := newH264Source(daemonAddr, token, displayID, expectedWidth, expectedHeight)
+	go source.run()
+	if cursorURL != "" {
+		go source.pollCursorURL(cursorURL)
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) { handleOffer(h264, w, r) })
-	mux.HandleFunc("/cursor", func(w http.ResponseWriter, r *http.Request) { handleCursor(h264, w, r) })
-	mux.HandleFunc("/debug/status", func(w http.ResponseWriter, r *http.Request) { handleDebugStatus(h264, w, r) })
+	mux.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) { handleOffer(source, w, r) })
+	mux.HandleFunc("/cursor", func(w http.ResponseWriter, r *http.Request) { handleCursor(source, w, r) })
+	mux.HandleFunc("/debug/status", func(w http.ResponseWriter, r *http.Request) { handleDebugStatus(source, w, r) })
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, "ok\n")
@@ -174,38 +302,10 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, browserHTML)
 	})
-	log.Printf("WebRTC gateway listening on %s, Android H264=%s", listen, android)
+
+	log.Printf("WebRTC gateway listening on %s; scrcpy daemon=%s displayId=%d", listen, daemonAddr, displayID)
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
-
-type debugStatus struct {
-	Source struct {
-		Address        string `json:"address"`
-		Connected      bool   `json:"connected"`
-		ConnectCount   uint64 `json:"connectCount"`
-		Width          int    `json:"width"`
-		Height         int    `json:"height"`
-		Frames         uint64 `json:"frames"`
-		KeyFrames      uint64 `json:"keyFrames"`
-		ConfigFrames   uint64 `json:"configFrames"`
-		Bytes          uint64 `json:"bytes"`
-		LastFrameSize  int    `json:"lastFrameSize"`
-		LastFrameAt    string `json:"lastFrameAt,omitempty"`
-		ProfileLevelID string `json:"profileLevelId,omitempty"`
-		LastError      string `json:"lastError,omitempty"`
-		PLI            uint64 `json:"pli"`
-		FramesSent     uint64 `json:"framesSent"`
-		KeyFramesSent  uint64 `json:"keyFramesSent"`
-		ConfigSent     uint64 `json:"configSent"`
-		WaitedNoConfig uint64 `json:"waitedNoConfig"`
-		FrameOverruns  uint64 `json:"frameOverruns"`
-		RecoveryCount  uint64 `json:"recoveryCount"`
-	} `json:"source"`
-	WebRTC struct {
-		Note string `json:"note"`
-	} `json:"webrtc"`
-}
-
 func handleCursor(src *h264Source, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
@@ -226,6 +326,35 @@ type cursorState struct {
 	Height  int  `json:"height"`
 }
 
+type debugStatus struct {
+	Source struct {
+		Address        string `json:"address"`
+		Connected      bool   `json:"connected"`
+		ConnectCount   uint64 `json:"connectCount"`
+		Width          int    `json:"width"`
+		Height         int    `json:"height"`
+		ExpectedWidth  int    `json:"expectedWidth"`
+		ExpectedHeight int    `json:"expectedHeight"`
+		DisplayID      int    `json:"displayId"`
+		Frames         uint64 `json:"frames"`
+		KeyFrames      uint64 `json:"keyFrames"`
+		ConfigFrames   uint64 `json:"configFrames"`
+		Bytes          uint64 `json:"bytes"`
+		LastFrameSize  int    `json:"lastFrameSize"`
+		LastFrameAt    string `json:"lastFrameAt,omitempty"`
+		ProfileLevelID string `json:"profileLevelId,omitempty"`
+		LastError      string `json:"lastError,omitempty"`
+		PLI            uint64 `json:"pli"`
+		FramesSent     uint64 `json:"framesSent"`
+		KeyFramesSent  uint64 `json:"keyFramesSent"`
+		ConfigSent     uint64 `json:"configSent"`
+		WaitedNoConfig uint64 `json:"waitedNoConfig"`
+	} `json:"source"`
+	WebRTC struct {
+		Note string `json:"note,omitempty"`
+	} `json:"webrtc"`
+}
+
 func handleDebugStatus(src *h264Source, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
@@ -238,6 +367,9 @@ func handleDebugStatus(src *h264Source, w http.ResponseWriter, r *http.Request) 
 	st.Source.ConnectCount = src.connectCount
 	st.Source.Width = src.header.Width
 	st.Source.Height = src.header.Height
+	st.Source.ExpectedWidth = src.expectedWidth
+	st.Source.ExpectedHeight = src.expectedHeight
+	st.Source.DisplayID = src.displayID
 	st.Source.Frames = src.frames
 	st.Source.KeyFrames = src.keyFrames
 	st.Source.ConfigFrames = src.configFrames
@@ -306,7 +438,7 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 
 	// 创建拦截器注册表
 	i := &interceptor.Registry{}
-	
+
 	// 注册默认拦截器 (提供 NACK 丢包重传、RTCP 报告等基础能力)
 	if err = webrtc.RegisterDefaultInterceptors(m, i); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -338,19 +470,10 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 	// Drain and inspect RTCP. A PLI/FIR means the browser needs a fresh keyframe.
 	if sender := pc.GetSenders(); len(sender) > 0 {
 		go func() {
-			buf := make([]byte, 4096)
 			for {
-				n, _, e := sender[0].Read(buf)
+				pkts, _, e := sender[0].ReadRTCP()
 				if e != nil {
 					return
-				}
-				if n <= 0 {
-					continue
-				}
-				pkts, e := rtcp.Unmarshal(buf[:n])
-				if e != nil {
-					log.Printf("[H264-RTCP] unmarshal failed: %v", e)
-					continue
 				}
 				for _, pkt := range pkts {
 					switch pkt.(type) {
@@ -372,7 +495,7 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 							log.Printf("[H264-RTCP] keyframe requested by browser (%T)", pkt)
 						}
 					case *rtcp.TransportLayerNack:
-						// No source-side packet loss exists because VDH1 is TCP.
+						// The source is TCP, so packet loss is recovered by the H264 keyframe path rather than RTP retransmission.
 					}
 				}
 			}
@@ -417,13 +540,371 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, local.SDP)
 }
 
-func newH264Source(addr, controlAddr string) *h264Source {
-	return &h264Source{addr: addr, controlAddr: controlAddr, changed: make(chan struct{})}
+func (s *h264Source) waitProfile(timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.mu.RLock()
+		profile := s.profileLevelID
+		haveConfig := len(s.sps) > 0 && len(s.pps) > 0
+		ch := s.changed
+		s.mu.RUnlock()
+		if profile != "" && haveConfig {
+			return profile
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return profile
+		}
+		t := time.NewTimer(remaining)
+		select {
+		case <-ch:
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
+		case <-t.C:
+			return profile
+		}
+	}
 }
 
-func (s *h264Source) pollCursor() {
+func newH264Source(addr, token string, displayID, expectedWidth, expectedHeight int) *h264Source {
+	return &h264Source{
+		addr:           addr,
+		token:          token,
+		displayID:      displayID,
+		expectedWidth:  expectedWidth,
+		expectedHeight: expectedHeight,
+		changed:        make(chan struct{}),
+	}
+}
+
+func (s *h264Source) run() {
+	for {
+		if err := s.readOnce(); err != nil {
+			s.mu.Lock()
+			s.lastError = err.Error()
+			s.connected = false
+			s.mu.Unlock()
+			log.Printf("scrcpy daemon source: %v", err)
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+}
+
+func (s *h264Source) readOnce() error {
+	if err := s.ensureSession(); err != nil {
+		return err
+	}
+
+	conn, err := s.openVideoSocket()
+	if err != nil {
+		// If the configured session vanished, force a fresh negotiation on next attempt.
+		s.dropSession()
+		return err
+	}
+
+	s.videoMu.Lock()
+	s.videoConn = conn
+	s.videoMu.Unlock()
+
+	s.mu.Lock()
+	s.connected = true
+	s.connectCount++
+	s.lastError = ""
+	s.mu.Unlock()
+
+	defer func() {
+		_ = conn.Close()
+		s.videoMu.Lock()
+		if s.videoConn == conn {
+			s.videoConn = nil
+		}
+		s.videoMu.Unlock()
+		s.mu.Lock()
+		s.connected = false
+		s.mu.Unlock()
+	}()
+
+	return s.readScrcpyVideoStream(conn)
+}
+
+func (s *h264Source) ensureSession() error {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if s.session != nil {
+		return nil
+	}
+
+	log.Printf("scrcpy daemon negotiation connecting: %s", s.addr)
+	c, err := net.DialTimeout("tcp", s.addr, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	configureTCP(c)
+
+	br := bufio.NewReaderSize(c, 64*1024)
+	if err := writeU8(c, roleNegotiation); err != nil {
+		_ = c.Close()
+		return err
+	}
+
+	sid, err := readI32(br)
+	if err != nil {
+		_ = c.Close()
+		return err
+	}
+
+	if s.token != "" {
+		if err := writeString32(c, s.token); err != nil {
+			_ = c.Close()
+			return err
+		}
+	}
+
+	// Device meta is emitted by ClientSession after authentication/session creation.
+	meta := make([]byte, 64)
+	if _, err := io.ReadFull(br, meta); err != nil {
+		_ = c.Close()
+		return err
+	}
+
+	options := strings.Join([]string{
+		"video=true",
+		"audio=false",
+		"video_codec=h264",
+		"send_stream_meta=true",
+		"send_frame_meta=true",
+	}, "\n") + "\n"
+
+	const seq = int64(1)
+	if err := writeConfigureSession(c, seq, options, []roleEntry{{role: roleVideo, displayID: int32(s.displayID)}}); err != nil {
+		_ = c.Close()
+		return err
+	}
+
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	response, err := readGenericResponse(br)
+	if err != nil {
+		_ = c.Close()
+		return fmt.Errorf("CONFIGURE_SESSION response: %w", err)
+	}
+	c.SetReadDeadline(time.Time{})
+
+	if response.sequence != seq {
+		_ = c.Close()
+		return fmt.Errorf("CONFIGURE_SESSION sequence mismatch: got %d want %d", response.sequence, seq)
+	}
+	if response.statusCode != 0 {
+		_ = c.Close()
+		return fmt.Errorf("CONFIGURE_SESSION failed: status=%d message=%s", response.statusCode, response.message)
+	}
+
+	s.session = c
+	s.sessionID = sid
+	log.Printf("scrcpy daemon session established: sessionId=%d device=%q", sid, trimCString(meta))
+	return nil
+}
+
+func (s *h264Source) openVideoSocket() (net.Conn, error) {
+	s.sessionMu.Lock()
+	sid := s.sessionID
+	sessionAlive := s.session != nil
+	s.sessionMu.Unlock()
+	if !sessionAlive {
+		return nil, fmt.Errorf("daemon session not established")
+	}
+
+	c, err := net.DialTimeout("tcp", s.addr, 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	configureTCP(c)
+
+	if err := writeU8(c, roleVideo); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := writeI32(c, sid); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := writeI32(c, int32(s.displayID)); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+
+	br := bufio.NewReaderSize(c, 256*1024)
+	ack, err := readI32(br)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if int(ack) != s.displayID {
+		_ = c.Close()
+		return nil, fmt.Errorf("ROLE_VIDEO displayId ack mismatch: got %d want %d", ack, s.displayID)
+	}
+
+	// From here the socket is exactly the daemon's scrcpy Streamer output:
+	//   int32 codecId
+	//   int32 sessionFlags + int32 width + int32 height
+	//   repeated: uint64 ptsAndFlags + int32 payloadSize + payload
+	// The buffered reader must remain associated with the connection for the whole stream.
+	return &bufferedConn{Conn: c, r: br}, nil
+}
+
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+func (s *h264Source) readScrcpyVideoStream(conn net.Conn) error {
+	bc, ok := conn.(*bufferedConn)
+	if !ok {
+		return fmt.Errorf("internal video connection type error")
+	}
+
+	codecID, err := readI32(bc.r)
+	if err != nil {
+		return err
+	}
+	if uint32(codecID) != codecH264ID {
+		return fmt.Errorf("unsupported scrcpy video codec id=0x%08x (want H264=0x%08x)", uint32(codecID), codecH264ID)
+	}
+
+	sessionFlags, err := readU32(bc.r)
+	if err != nil {
+		return err
+	}
+	width, err := readI32(bc.r)
+	if err != nil {
+		return err
+	}
+	height, err := readI32(bc.r)
+	if err != nil {
+		return err
+	}
+	if sessionFlags&packetFlagSession == 0 {
+		return fmt.Errorf("invalid scrcpy session metadata flags=0x%08x", sessionFlags)
+	}
+
+	s.mu.Lock()
+	s.header.Width = int(width)
+	s.header.Height = int(height)
+	s.mu.Unlock()
+	log.Printf("scrcpy ROLE_VIDEO connected: displayId=%d codec=H264 %dx%d sessionFlags=0x%08x",
+		s.displayID, width, height, sessionFlags)
+
+	for {
+		rawFlags, err := readU64(bc.r)
+		if err != nil {
+			return err
+		}
+		size, err := readI32(bc.r)
+		if err != nil {
+			return err
+		}
+		if size <= 0 || size > maxFramePayload {
+			return fmt.Errorf("invalid scrcpy frame size=%d", size)
+		}
+
+		data := make([]byte, int(size))
+		if _, err := io.ReadFull(bc.r, data); err != nil {
+			return err
+		}
+
+		config := (rawFlags & packetFlagConfig) != 0
+		key := (rawFlags & packetFlagKeyFrame) != 0
+		pts := int64(rawFlags &^ (packetFlagConfig | packetFlagKeyFrame))
+
+		normalized, sps, pps, ok := normalizeH264(data)
+		if !ok {
+			return fmt.Errorf("unsupported H264 payload size=%d first=%s", len(data), firstBytes(data, 16))
+		}
+
+		if hasNALType(normalized, 5) {
+			key = true
+		}
+		flags := 0
+		if config {
+			flags |= flagConfig
+		}
+		if key {
+			flags |= flagKeyFrame
+		}
+
+		now := time.Now()
+
+		s.mu.Lock()
+		if len(sps) > 0 {
+			s.sps = append([]byte(nil), sps...)
+			if p := profileLevelID(sps); p != "" {
+				s.profileLevelID = p
+			}
+		}
+		if len(pps) > 0 {
+			s.pps = append([]byte(nil), pps...)
+		}
+		if len(s.sps) > 0 && len(s.pps) > 0 {
+			s.config = annexBJoin(s.sps, s.pps)
+		}
+		if config && len(s.config) > 0 {
+			s.configFrames++
+		}
+
+		s.seq++
+		f := &h264Frame{
+			seq:        s.seq,
+			ptsUs:      pts,
+			flags:      flags,
+			data:       normalized,
+			receivedAt: now,
+		}
+		s.latest = f
+		s.history = append(s.history, f)
+
+		cutoff := now.Add(-frameHistoryWindow)
+		firstKeep := 0
+		for firstKeep < len(s.history) &&
+			(len(s.history)-firstKeep > frameHistoryMaxFrames || s.history[firstKeep].receivedAt.Before(cutoff)) {
+			firstKeep++
+		}
+		if firstKeep > 0 {
+			s.history = append([]*h264Frame(nil), s.history[firstKeep:]...)
+		}
+
+		s.frames++
+		s.bytes += uint64(len(normalized))
+		s.lastFrameAt = now
+		s.lastFrameSize = len(normalized)
+		if key {
+			s.latestKey = f
+			s.keyFrames++
+		}
+
+		old := s.changed
+		s.changed = make(chan struct{})
+		close(old)
+		s.mu.Unlock()
+	}
+}
+
+func (s *h264Source) dropSession() {
+	s.sessionMu.Lock()
+	if s.session != nil {
+		_ = s.session.Close()
+	}
+	s.session = nil
+	s.sessionID = 0
+	s.sessionMu.Unlock()
+}
+
+func (s *h264Source) pollCursorURL(url string) {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
-	url := "http://" + s.controlAddr + "/api/webrtc/cursor"
 	ticker := time.NewTicker(33 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -433,7 +914,7 @@ func (s *h264Source) pollCursor() {
 		}
 		var c cursorState
 		err = json.NewDecoder(resp.Body).Decode(&c)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			continue
 		}
@@ -443,178 +924,174 @@ func (s *h264Source) pollCursor() {
 	}
 }
 
-func (s *h264Source) run() {
-	for {
-		if err := s.readOnce(); err != nil {
-			log.Printf("H264 source: %v", err)
-			time.Sleep(time.Second)
-		}
+// ---- daemon protocol helpers ----
+
+type roleEntry struct {
+	role      int
+	displayID int32
+}
+
+func configureTCP(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetReadBuffer(1024 * 1024)
+		_ = tc.SetWriteBuffer(1024 * 1024)
+		_ = tc.SetKeepAlive(true)
 	}
 }
 
-func (s *h264Source) readOnce() error {
-	log.Printf("H264 source connecting: %s", s.addr)
-	c, err := net.DialTimeout("tcp", s.addr, 3*time.Second)
-	if err != nil {
-		s.mu.Lock()
-		s.connected = false
-		s.lastError = err.Error()
-		s.mu.Unlock()
-		return err
-	}
-	s.mu.Lock()
-	s.connected = true
-	s.connectCount++
-	s.lastError = ""
-	s.mu.Unlock()
-	log.Printf("H264 source connected: %s", s.addr)
-	defer func() {
-		c.Close()
-		s.mu.Lock()
-		s.connected = false
-		s.mu.Unlock()
-		log.Printf("H264 source disconnected: %s", s.addr)
-	}()
-	br := bufio.NewReaderSize(c, 256*1024)
-	magicBuf := make([]byte, 4)
-	if _, err = io.ReadFull(br, magicBuf); err != nil {
-		return err
-	}
-	if string(magicBuf) != magic {
-		return fmt.Errorf("bad magic %q", magicBuf)
-	}
-	var values [4]int32
-	if err = binary.Read(br, binary.BigEndian, &values); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.header.Width = int(values[2])
-	s.header.Height = int(values[3])
-	s.mu.Unlock()
-	log.Printf("VDH1 header received: version=%d displayId=%d width=%d height=%d", values[0], values[1], values[2], values[3])
+func writeU8(c net.Conn, v int) error {
+	_, err := c.Write([]byte{byte(v)})
+	return err
+}
 
-	for {
-		typ, err := br.ReadByte()
-		if err != nil {
+func writeI32(c net.Conn, v int32) error {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(v))
+	_, err := c.Write(b[:])
+	return err
+}
+
+func writeU32(c net.Conn, v uint32) error {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], v)
+	_, err := c.Write(b[:])
+	return err
+}
+
+func writeU64(c net.Conn, v uint64) error {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], v)
+	_, err := c.Write(b[:])
+	return err
+}
+
+func writeString32(c net.Conn, v string) error {
+	b := []byte(v)
+	if err := writeI32(c, int32(len(b))); err != nil {
+		return err
+	}
+	_, err := c.Write(b)
+	return err
+}
+
+func writeConfigureSession(c net.Conn, seq int64, options string, entries []roleEntry) error {
+	if err := writeU8(c, typeConfigureSession); err != nil {
+		return err
+	}
+	if err := writeU64(c, uint64(seq)); err != nil {
+		return err
+	}
+	if err := writeString32(c, options); err != nil {
+		return err
+	}
+	if err := writeI32(c, 0); err != nil { // legacy rolesMask: unused when entries are present
+		return err
+	}
+	if err := writeI32(c, int32(len(entries))); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := writeU8(c, e.role); err != nil {
 			return err
 		}
-		switch typ {
-		case typeFormat:
-			var wh [8]byte
-			if _, err = io.ReadFull(br, wh[:]); err != nil {
-				return err
-			}
-			s.mu.Lock()
-			s.header.Width = int(binary.BigEndian.Uint32(wh[:4]))
-			s.header.Height = int(binary.BigEndian.Uint32(wh[4:]))
-			s.mu.Unlock()
-			log.Printf("H264 format: %dx%d", s.header.Width, s.header.Height)
-		case typeFrame:
-			var hdr [16]byte
-			if _, err = io.ReadFull(br, hdr[:]); err != nil {
-				return err
-			}
-			pts := int64(binary.BigEndian.Uint64(hdr[:8]))
-			flags := int(binary.BigEndian.Uint32(hdr[8:12]))
-			size := int(binary.BigEndian.Uint32(hdr[12:16]))
-			if size <= 0 || size > 32*1024*1024 {
-				return fmt.Errorf("invalid frame size %d", size)
-			}
-			data := make([]byte, size)
-			if _, err = io.ReadFull(br, data); err != nil {
-				return err
-			}
-
-			normalized, sps, pps, ok := normalizeH264(data)
-			if !ok {
-				return fmt.Errorf("unsupported H264 payload format, size=%d first=%x", size, firstBytes(data, 16))
-			}
-
-			// Some encoders do not set the key-frame flag consistently. Detect IDR
-			// from the actual NAL units so a newly connected browser can start from
-			// a decodable access unit.
-			if hasNALType(normalized, 5) {
-				flags |= flagKeyFrame
-			}
-
-			if flags&flagConfig != 0 || len(sps) > 0 || len(pps) > 0 {
-				s.mu.Lock()
-				if len(sps) > 0 {
-					s.sps = append([]byte(nil), sps...)
-					if p := profileLevelID(sps); p != "" {
-						s.profileLevelID = p
-					}
-				}
-				if len(pps) > 0 {
-					s.pps = append([]byte(nil), pps...)
-				}
-				if len(s.sps) > 0 && len(s.pps) > 0 {
-					s.config = annexBJoin(s.sps, s.pps)
-				}
-				cfgSize := len(s.config)
-				profile := s.profileLevelID
-				if cfgSize > 0 {
-					s.configFrames++
-				}
-				s.mu.Unlock()
-				if cfgSize > 0 {
-					log.Printf("H264 config cached: size=%d profile-level-id=%s", cfgSize, profile)
-				}
-			}
-
-			s.mu.Lock()
-			s.seq++
-			now := time.Now()
-			f := &h264Frame{seq: s.seq, ptsUs: pts, flags: flags, data: normalized, receivedAt: now}
-			s.latest = f
-			s.history = append(s.history, f)
-			cutoff := now.Add(-frameHistoryWindow)
-			firstKeep := 0
-			for firstKeep < len(s.history) && (len(s.history)-firstKeep > frameHistoryMaxFrames || s.history[firstKeep].receivedAt.Before(cutoff)) {
-				firstKeep++
-			}
-			if firstKeep > 0 {
-				s.history = append([]*h264Frame(nil), s.history[firstKeep:]...)
-			}
-			s.frames++
-			s.bytes += uint64(len(normalized))
-			s.lastFrameAt = time.Now()
-			s.lastFrameSize = len(normalized)
-			if flags&flagKeyFrame != 0 {
-				s.latestKey = f
-				s.keyFrames++
-				log.Printf("H264 key frame: seq=%d pts=%d size=%d", f.seq, pts, len(normalized))
-			}
-			old := s.changed
-			s.changed = make(chan struct{})
-			close(old)
-			s.mu.Unlock()
-		default:
-			return fmt.Errorf("unknown packet type %d", typ)
+		if err := writeI32(c, e.displayID); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
-func (s *h264Source) waitProfile(timeout time.Duration) string {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		s.mu.RLock()
-		p := s.profileLevelID
-		ch := s.changed
-		s.mu.RUnlock()
-		if p != "" {
-			return p
-		}
-		select {
-		case <-ch:
-		case <-time.After(100 * time.Millisecond):
-		}
+type genericResponse struct {
+	sequence   int64
+	statusCode int32
+	displayID  int32
+	message    string
+}
+
+func readGenericResponse(r io.Reader) (genericResponse, error) {
+	typ, err := readU8(r)
+	if err != nil {
+		return genericResponse{}, err
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.profileLevelID
+	if typ != typeGenericResponse {
+		return genericResponse{}, fmt.Errorf("unexpected daemon response type=%d", typ)
+	}
+	seq, err := readI64(r)
+	if err != nil {
+		return genericResponse{}, err
+	}
+	status, err := readI32(r)
+	if err != nil {
+		return genericResponse{}, err
+	}
+	display, err := readI32(r)
+	if err != nil {
+		return genericResponse{}, err
+	}
+	n, err := readI32(r)
+	if err != nil {
+		return genericResponse{}, err
+	}
+	if n < 0 || n > 1<<20 {
+		return genericResponse{}, fmt.Errorf("invalid daemon response message length=%d", n)
+	}
+	b := make([]byte, int(n))
+	if _, err := io.ReadFull(r, b); err != nil {
+		return genericResponse{}, err
+	}
+	return genericResponse{
+		sequence:   seq,
+		statusCode: status,
+		displayID:  display,
+		message:    string(b),
+	}, nil
 }
 
+func readU8(r io.Reader) (byte, error) {
+	var b [1]byte
+	_, err := io.ReadFull(r, b[:])
+	return b[0], err
+}
+
+func readI32(r io.Reader) (int32, error) {
+	var b [4]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return 0, err
+	}
+	return int32(binary.BigEndian.Uint32(b[:])), nil
+}
+
+func readU32(r io.Reader) (uint32, error) {
+	var b [4]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(b[:]), nil
+}
+
+func readU64(r io.Reader) (uint64, error) {
+	var b [8]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint64(b[:]), nil
+}
+
+func readI64(r io.Reader) (int64, error) {
+	var b [8]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return 0, err
+	}
+	return int64(binary.BigEndian.Uint64(b[:])), nil
+}
+
+func trimCString(b []byte) string {
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		b = b[:i]
+	}
+	return string(b)
+}
 func (s *h264Source) pipeTo(track *webrtc.TrackLocalStaticSample, pc *webrtc.PeerConnection) {
 	var lastSeq uint64
 	var ptsBaseUs int64 = -1
@@ -640,7 +1117,7 @@ func (s *h264Source) pipeTo(track *webrtc.TrackLocalStaticSample, pc *webrtc.Pee
 				dur = d
 			}
 		}
-		if err := track.WriteSample(media.Sample{Data: pendingData, Duration: dur}); err != nil {
+		if err := track.WriteSample(media.Sample{Data: pendingData, PacketTimestamp: uint32((pendingRelPtsUs * 90) / 1000), Duration: dur}); err != nil {
 			return err
 		}
 		s.mu.Lock()

@@ -66,6 +66,7 @@ class DisplayActivity : ComponentActivity() {
     private var videoWidth = 0
     private var videoHeight = 0
     private var currentVideoRotation = 0
+    private var videoDpi = 160
     private var desktopMode = false
     private var desktopWebRtcRunning = false
     private var trackpadEnabled = false
@@ -91,6 +92,7 @@ class DisplayActivity : ComponentActivity() {
 
     private lateinit var rootLayout: FrameLayout
     private lateinit var videoSurfaceView: VideoSurfaceView
+    private lateinit var cursorOverlayView: DesktopCursorOverlayView
     private lateinit var statsOverlay: TextView
     private lateinit var controlPanel: DisplayControlPanel
     private lateinit var inputController: InputController
@@ -206,7 +208,6 @@ class DisplayActivity : ComponentActivity() {
 
     override fun onDestroy() {
         desktopWebRtcMonitorJob?.cancel()
-        runCatching { repository.stopWebRtcH264Output() }
         runCatching { gatewayProcessController.stop() }
         super.onDestroy()
         backCallback.remove()
@@ -269,6 +270,7 @@ class DisplayActivity : ComponentActivity() {
             isFocusableInTouchMode = false
             addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
                 updateContentRect()
+                if (::cursorOverlayView.isInitialized) cursorOverlayView.invalidate()
             }
             setOnTouchListener { view, event ->
                 handleTouchEvent(event)
@@ -320,6 +322,22 @@ class DisplayActivity : ComponentActivity() {
             })
         }
         rootLayout.addView(videoSurfaceView)
+
+        // Draw the desktop/trackpad cursor in the app window itself. A system
+        // mouse pointer is a separate SurfaceFlinger layer and is not included
+        // in the captured virtual-display frame, so this overlay is also what
+        // lets the phone act as a visible local touchpad.
+        cursorOverlayView = DesktopCursorOverlayView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                Gravity.TOP or Gravity.START,
+            )
+            attachToVideoView(videoSurfaceView)
+            visibility = if (desktopMode || trackpadEnabled) View.VISIBLE else View.GONE
+        }
+        rootLayout.addView(cursorOverlayView)
+
         controlPanel = DisplayControlPanel(
             context = this,
             onBackClick = { inputController.injectKey(KeyEvent.KEYCODE_BACK) },
@@ -365,7 +383,7 @@ class DisplayActivity : ComponentActivity() {
         desktopWebRtcMonitorJob?.cancel()
         desktopWebRtcMonitorJob = lifecycleScope.launch {
             while (!isFinishing && !isDestroyed) {
-                val running = repository.getWebRtcH264OutputStatus().running
+                val running = gatewayProcessController.isRunning()
                 if (running != desktopWebRtcRunning) {
                     desktopWebRtcRunning = running
                     updateWebRtcUi(running)
@@ -390,8 +408,16 @@ class DisplayActivity : ComponentActivity() {
         inputController.cancelActiveTouch()
         inputController.setTrackpadModeEnabled(if (desktopMode) true else trackpadEnabled)
 
-        if (running && (desktopMode || trackpadEnabled)) {
-            DesktopCursorState.reset(1920, 1080)
+        if (desktopMode || trackpadEnabled) {
+            if (videoWidth > 0 && videoHeight > 0) {
+                DesktopCursorState.reset(videoWidth, videoHeight, videoDpi)
+            }
+        } else {
+            DesktopCursorState.hide()
+        }
+        if (::cursorOverlayView.isInitialized) {
+            cursorOverlayView.visibility = if (desktopMode || trackpadEnabled) View.VISIBLE else View.GONE
+            cursorOverlayView.invalidate()
         }
 
         val hideLocalPreview = shouldHideLocalPreview(running)
@@ -427,7 +453,7 @@ class DisplayActivity : ComponentActivity() {
         trackpadEnabled = newEnabled
         inputController.setTrackpadModeEnabled(newEnabled)
 
-        val running = repository.getWebRtcH264OutputStatus().running
+        val running = gatewayProcessController.isRunning()
         val hideLocalPreview = shouldHideLocalPreview(running)
         if (::videoSurfaceView.isInitialized) {
             videoSurfaceView.visibility = if (hideLocalPreview) View.INVISIBLE else View.VISIBLE
@@ -441,7 +467,17 @@ class DisplayActivity : ComponentActivity() {
         if (::statsOverlay.isInitialized) {
             statsOverlay.visibility = if (hideLocalPreview) View.GONE else View.VISIBLE
         }
-        DesktopCursorState.reset(1920, 1080)
+        if (trackpadEnabled) {
+            if (videoWidth > 0 && videoHeight > 0) {
+                DesktopCursorState.reset(videoWidth, videoHeight, videoDpi)
+            }
+        } else {
+            DesktopCursorState.hide()
+        }
+        if (::cursorOverlayView.isInitialized) {
+            cursorOverlayView.visibility = if (trackpadEnabled || desktopMode) View.VISIBLE else View.GONE
+            cursorOverlayView.invalidate()
+        }
         Log.i(TAG, "trackpadEnabled=$trackpadEnabled running=$running hideLocalPreview=$hideLocalPreview")
     }
 
@@ -452,45 +488,26 @@ class DisplayActivity : ComponentActivity() {
             return
         }
         lifecycleScope.launch(Dispatchers.IO) {
-            if (repository.getWebRtcH264OutputStatus().running) {
-                // Stop the APK-owned H.264 endpoint through the repository first,
-                // then terminate the external gateway. Never use the debug HTTP API
-                // for the in-app shutdown path.
-                repository.stopWebRtcH264Output()
+            if (gatewayProcessController.isRunning()) {
                 runCatching { gatewayProcessController.stop() }
                 runOnUiThread { android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 已停止", android.widget.Toast.LENGTH_SHORT).show() }
                 return@launch
             }
 
-            // 关键顺序：先在 APK 内直接创建当前 Display 的 H.264 输出端口，
-            // 再启动独立 Gateway 去消费该端口。HTTP /api/webrtc/start 仅保留给外部调试。
-            val h264Result = repository.startWebRtcH264Output(
-                displayId = displayId,
-                bindHost = "127.0.0.1",
-                port = GatewayProcessController.DEFAULT_H264_PORT
-            )
-            if (h264Result.isFailure) {
-                val error = h264Result.exceptionOrNull() ?: IllegalStateException("H.264 输出启动失败")
-                Log.e(TAG, "Failed to start H264 output", error)
-                runOnUiThread {
-                    android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 启动失败: ${error.message}", android.widget.Toast.LENGTH_LONG).show()
-                }
-                return@launch
-            }
-
+            // WebRTC Gateway 现在直接连接当前 scrcpy daemon 的 ROLE_NEGOTIATION +
+            // ROLE_VIDEO，不再创建额外的 VDH1 H.264 旁路。
             val result = gatewayProcessController.start(
                 displayId = displayId,
-                h264Port = GatewayProcessController.DEFAULT_H264_PORT,
                 gatewayPort = GatewayProcessController.DEFAULT_GATEWAY_PORT,
-                bindHost = "0.0.0.0"
+                bindHost = "0.0.0.0",
+                expectedWidth = videoWidth,
+                expectedHeight = videoHeight,
             )
             result.onSuccess { url ->
                 runOnUiThread {
                     android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 已启动: $url", android.widget.Toast.LENGTH_SHORT).show()
                 }
             }.onFailure { error ->
-                // Gateway 启动失败时回滚 H.264 endpoint，避免本机画面被误判为正在 WebRTC。
-                repository.stopWebRtcH264Output()
                 Log.e(TAG, "Failed to start WebRTC gateway", error)
                 runOnUiThread {
                     android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 启动失败: ${error.message}", android.widget.Toast.LENGTH_LONG).show()
@@ -524,6 +541,10 @@ class DisplayActivity : ComponentActivity() {
         videoHeight = height
         inputController.updateVideoSize(width, height)
         videoSurfaceView.setVideoSize(width, height)
+        if ((desktopMode || trackpadEnabled) && width > 0 && height > 0) {
+            DesktopCursorState.reset(width, height, videoDpi)
+            if (::cursorOverlayView.isInitialized) cursorOverlayView.invalidate()
+        }
 
         val viewW = rootLayout.width
         val viewH = rootLayout.height
@@ -623,8 +644,13 @@ class DisplayActivity : ComponentActivity() {
             Log.i(TAG, "applyDisplayDimensions: #$remoteDisplayId size=${width}x${height} (prev=${videoWidth}x${videoHeight})")
             videoWidth = width
             videoHeight = height
+            videoDpi = dpi.coerceAtLeast(1)
             inputController.updateVideoSize(width, height)
             videoSurfaceView.setVideoSize(width, height)
+            if ((desktopMode || trackpadEnabled) && width > 0 && height > 0) {
+                DesktopCursorState.reset(width, height, videoDpi)
+                if (::cursorOverlayView.isInitialized) cursorOverlayView.invalidate()
+            }
 
             // Retroactively feed the pending surface to the decoder if it
             // arrived before display dimensions were known.
