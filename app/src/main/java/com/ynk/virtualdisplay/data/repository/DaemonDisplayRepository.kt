@@ -484,6 +484,15 @@ class DaemonDisplayRepository(
         return startResult
     }
 
+    override suspend fun setLocalVideoDecodeEnabled(displayId: Int, enabled: Boolean): Result<Unit> {
+        return runCatching {
+            videoController.setLocalVideoDecodeEnabled(enabled)
+        }.fold(
+            onSuccess = { Result.success(Unit) },
+            onFailure = { Result.failure(it) }
+        )
+    }
+
     override suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit> {
         // 调整尺寸 → Remote DataSource
         val result = remoteDataSource.resizeDisplay(displayId, width, height, dpi)

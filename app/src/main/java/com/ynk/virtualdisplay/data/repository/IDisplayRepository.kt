@@ -65,6 +65,9 @@ interface IDisplayRepository {
     /** 设置显示器 Surface — 驱动客户端 H264 解码器 */
     suspend fun setDisplaySurface(displayId: Int, surface: Surface?): Result<Unit>
 
+    /** Enable/disable local video decoding without reconnecting video/control sockets. */
+    suspend fun setLocalVideoDecodeEnabled(displayId: Int, enabled: Boolean): Result<Unit> = Result.success(Unit)
+
     /** 重新调整指定虚拟显示器的物理尺寸和 DPI */
     suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit>
 

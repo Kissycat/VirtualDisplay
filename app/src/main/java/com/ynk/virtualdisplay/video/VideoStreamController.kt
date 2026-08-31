@@ -185,6 +185,11 @@ class VideoStreamController(
         decoder?.setDisplaySurface(surface)
     }
 
+    /** Toggle only local MediaCodec decoding. Does not reconnect or modify any socket. */
+    fun setLocalVideoDecodeEnabled(enabled: Boolean) {
+        decoder?.setLocalDecodeEnabled(enabled)
+    }
+
     fun updateResolution(w: Int, h: Int) {
         decoder?.updateResolution(w, h)
     }

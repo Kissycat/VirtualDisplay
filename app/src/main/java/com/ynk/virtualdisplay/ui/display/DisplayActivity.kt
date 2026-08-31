@@ -401,6 +401,33 @@ class DisplayActivity : ComponentActivity() {
         return webRtcRunning && (desktopMode || trackpadEnabled)
     }
 
+    private suspend fun setLocalDecodeSuppressedSync(suppressed: Boolean) {
+        val displayId = remoteDisplayId ?: return
+        repository.setLocalVideoDecodeEnabled(displayId, !suppressed)
+            .onFailure { Log.w(TAG, "Failed to set local video decode=${!suppressed}", it) }
+    }
+
+    private fun applyLocalPreviewUi(suppressed: Boolean) {
+        if (::videoSurfaceView.isInitialized) {
+            videoSurfaceView.visibility = if (suppressed) View.INVISIBLE else View.VISIBLE
+        }
+        if (::rootLayout.isInitialized) {
+            rootLayout.setBackgroundColor(if (suppressed) Color.BLACK else Color.TRANSPARENT)
+        }
+        if (::controlPanel.isInitialized) {
+            controlPanel.visibility = View.VISIBLE
+        }
+        if (::statsOverlay.isInitialized) {
+            statsOverlay.visibility = if (suppressed) View.GONE else View.VISIBLE
+        }
+    }
+
+    private fun setLocalDecodeSuppressed(suppressed: Boolean) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            setLocalDecodeSuppressedSync(suppressed)
+        }
+    }
+
     private fun updateWebRtcUi(running: Boolean) {
         // Always clear any old input mode before switching state. In particular,
         // disabling the normal-mode touchpad must leave the next gesture entirely
@@ -421,18 +448,8 @@ class DisplayActivity : ComponentActivity() {
         }
 
         val hideLocalPreview = shouldHideLocalPreview(running)
-        if (::videoSurfaceView.isInitialized) {
-            videoSurfaceView.visibility = if (hideLocalPreview) View.INVISIBLE else View.VISIBLE
-        }
-        if (::rootLayout.isInitialized) {
-            rootLayout.setBackgroundColor(if (hideLocalPreview) Color.BLACK else Color.TRANSPARENT)
-        }
-        if (::controlPanel.isInitialized) {
-            controlPanel.visibility = View.VISIBLE
-        }
-        if (::statsOverlay.isInitialized) {
-            statsOverlay.visibility = if (hideLocalPreview) View.GONE else View.VISIBLE
-        }
+        setLocalDecodeSuppressed(hideLocalPreview)
+        applyLocalPreviewUi(hideLocalPreview)
 
         Log.i(
             TAG,
@@ -455,18 +472,8 @@ class DisplayActivity : ComponentActivity() {
 
         val running = gatewayProcessController.isRunning()
         val hideLocalPreview = shouldHideLocalPreview(running)
-        if (::videoSurfaceView.isInitialized) {
-            videoSurfaceView.visibility = if (hideLocalPreview) View.INVISIBLE else View.VISIBLE
-        }
-        if (::rootLayout.isInitialized) {
-            rootLayout.setBackgroundColor(if (hideLocalPreview) Color.BLACK else Color.TRANSPARENT)
-        }
-        if (::controlPanel.isInitialized) {
-            controlPanel.visibility = View.VISIBLE
-        }
-        if (::statsOverlay.isInitialized) {
-            statsOverlay.visibility = if (hideLocalPreview) View.GONE else View.VISIBLE
-        }
+        setLocalDecodeSuppressed(hideLocalPreview)
+        applyLocalPreviewUi(hideLocalPreview)
         if (trackpadEnabled) {
             if (videoWidth > 0 && videoHeight > 0) {
                 DesktopCursorState.reset(videoWidth, videoHeight, videoDpi)
@@ -489,9 +496,24 @@ class DisplayActivity : ComponentActivity() {
         }
         lifecycleScope.launch(Dispatchers.IO) {
             if (gatewayProcessController.isRunning()) {
+                // Restore local decoding first, without touching Scrcpy sockets.
+                setLocalDecodeSuppressedSync(false)
                 runCatching { gatewayProcessController.stop() }
-                runOnUiThread { android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 已停止", android.widget.Toast.LENGTH_SHORT).show() }
+                runOnUiThread {
+                    applyLocalPreviewUi(false)
+                    updateWebRtcUi(false)
+                    android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 已停止", android.widget.Toast.LENGTH_SHORT).show()
+                }
                 return@launch
+            }
+
+            // Suppress local decode BEFORE starting WebRTC. Do this synchronously
+            // in the same IO coroutine, then hide the SurfaceView immediately.
+            // The ROLE_VIDEO and ROLE_CONTROL sockets remain untouched.
+            val suppressLocalDecode = desktopMode || trackpadEnabled
+            if (suppressLocalDecode) {
+                setLocalDecodeSuppressedSync(true)
+                runOnUiThread { applyLocalPreviewUi(true) }
             }
 
             // WebRTC Gateway 现在直接连接当前 scrcpy daemon 的 ROLE_NEGOTIATION +
@@ -505,11 +527,16 @@ class DisplayActivity : ComponentActivity() {
             )
             result.onSuccess { url ->
                 runOnUiThread {
+                    updateWebRtcUi(true)
                     android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 已启动: $url", android.widget.Toast.LENGTH_SHORT).show()
                 }
             }.onFailure { error ->
                 Log.e(TAG, "Failed to start WebRTC gateway", error)
+                // Gateway failed: restore local playback without reconnecting Scrcpy.
+                setLocalDecodeSuppressedSync(false)
                 runOnUiThread {
+                    applyLocalPreviewUi(false)
+                    updateWebRtcUi(false)
                     android.widget.Toast.makeText(this@DisplayActivity, "WebRTC 启动失败: ${error.message}", android.widget.Toast.LENGTH_LONG).show()
                 }
             }

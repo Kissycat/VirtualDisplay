@@ -36,6 +36,10 @@ class H264StreamDecoder(
     @Volatile private var dummySurfaceTexture: SurfaceTexture? = null
     @Volatile private var dummySurface: Surface? = null
     @Volatile private var isUsingDummySurface: Boolean = false
+    // Controls whether encoded Scrcpy frames are fed into MediaCodec for local playback.
+    // When false, frames are still read from the socket and broadcast to WebRTC sinks,
+    // but the local decoder input path is skipped entirely.
+    @Volatile private var localDecodeEnabled: Boolean = true
 
     private var inputWorker: Thread? = null
     private var outputWorker: Thread? = null
@@ -53,6 +57,16 @@ class H264StreamDecoder(
 
     fun removeEncodedVideoSink(sink: EncodedVideoSink) {
         encodedVideoBroadcaster.remove(sink)
+    }
+
+    /**
+     * Enable/disable local MediaCodec decoding without touching the Scrcpy video socket
+     * or the control channel. When disabled, encoded frames are still consumed from the
+     * socket and forwarded to WebRTC sinks, but are never queued into MediaCodec.
+     */
+    fun setLocalDecodeEnabled(enabled: Boolean) {
+        localDecodeEnabled = enabled
+        Log.i(TAG, "Local video decode ${if (enabled) "ENABLED" else "DISABLED"}")
     }
 
     @Volatile private var renderScheduler: SurfaceRenderScheduler? = null
@@ -230,6 +244,15 @@ class H264StreamDecoder(
                     tracker.recordFrameReceived(frame.ptsUs)
                 }
 
+                // WebRTC and local playback are intentionally decoupled. When local
+                // playback is suppressed, consume the encoded frame from the socket
+                // and stop here before MediaCodec input-buffer dequeue/queue. This
+                // avoids local H.264 decoding entirely while preserving ROLE_VIDEO
+                // transport and the ROLE_CONTROL input path.
+                if (!localDecodeEnabled) {
+                    continue
+                }
+
                 // Periodic stats log every 3s
                 val nowMs = System.currentTimeMillis()
                 if (nowMs - lastStatsLogMs >= 3000) {
@@ -347,7 +370,11 @@ class H264StreamDecoder(
                             // update decode latency stats
                             tracker.recordDecode(bufferInfo.presentationTimeUs)
 
-                            if (targetSurface != null && !isUsingDummySurface) {
+                            // When local playback is suppressed, do not render even
+                            // already-decoded frames that were queued before the flag
+                            // changed. We still dequeue/release them to drain the codec
+                            // cleanly, but nothing reaches the phone-side Surface.
+                            if (localDecodeEnabled && targetSurface != null && !isUsingDummySurface) {
                                 framesRendered++
                                 if (ultraLowLatency) {
                                     runCatching { activeCodec.releaseOutputBuffer(outputIndex, System.nanoTime()) }
