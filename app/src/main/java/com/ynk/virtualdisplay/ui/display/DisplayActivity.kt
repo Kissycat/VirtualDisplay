@@ -176,9 +176,11 @@ class DisplayActivity : ComponentActivity() {
         }
 
         lifecycleScope.launch {
-            AppSettings.showPerformanceStatsCache.collect { show ->
+            AppSettings.showPerformanceStatsCache.collect {
                 if (::statsOverlay.isInitialized) {
-                    statsOverlay.visibility = if (show) View.VISIBLE else View.GONE
+                    // Settings changes must immediately win over any mode/preview
+                    // transition that may have happened at the same time.
+                    applyStatsOverlayVisibility()
                 }
             }
         }
@@ -364,7 +366,10 @@ class DisplayActivity : ComponentActivity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setBackgroundColor(Color.parseColor("#80000000"))
             setPadding(16, 16, 16, 16)
-            visibility = View.VISIBLE
+            // Start hidden. AppSettings loads DataStore asynchronously; the collector
+            // below is responsible for making the persisted diagnostics setting visible.
+            // This prevents a disabled setting from flashing during Activity creation.
+            visibility = View.GONE
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -407,6 +412,13 @@ class DisplayActivity : ComponentActivity() {
             .onFailure { Log.w(TAG, "Failed to set local video decode=${!suppressed}", it) }
     }
 
+    private fun applyStatsOverlayVisibility() {
+        if (!::statsOverlay.isInitialized) return
+        val shouldShow = AppSettings.showPerformanceStatsCache.value &&
+            !shouldHideLocalPreview(gatewayProcessController.isRunning())
+        statsOverlay.visibility = if (shouldShow) View.VISIBLE else View.GONE
+    }
+
     private fun applyLocalPreviewUi(suppressed: Boolean) {
         if (::videoSurfaceView.isInitialized) {
             videoSurfaceView.visibility = if (suppressed) View.INVISIBLE else View.VISIBLE
@@ -417,8 +429,12 @@ class DisplayActivity : ComponentActivity() {
         if (::controlPanel.isInitialized) {
             controlPanel.visibility = View.VISIBLE
         }
+        // Do not use the preview state as a command to show diagnostics.
+        // The diagnostics switch in Settings remains authoritative across all
+        // WebRTC/trackpad/desktop-mode transitions.
         if (::statsOverlay.isInitialized) {
-            statsOverlay.visibility = if (suppressed) View.GONE else View.VISIBLE
+            val shouldShow = AppSettings.showPerformanceStatsCache.value && !suppressed
+            statsOverlay.visibility = if (shouldShow) View.VISIBLE else View.GONE
         }
     }
 
