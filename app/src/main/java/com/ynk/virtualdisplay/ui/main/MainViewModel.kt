@@ -63,6 +63,10 @@ class MainViewModel(
 
     private val appContext = context.applicationContext
 
+    private val desktopPrefs by lazy {
+        appContext.getSharedPreferences("desktop_shell_preferences", Context.MODE_PRIVATE)
+    }
+
     // === MVI State ===
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
@@ -404,11 +408,15 @@ class MainViewModel(
             VIRTUAL_DISPLAY_FLAG_OWN_FOCUS or
             VIRTUAL_DISPLAY_FLAG_DEVICE_DISPLAY_GROUP
 
+        val width = desktopPrefs.getInt("desktop_width", DESKTOP_WIDTH)
+        val height = desktopPrefs.getInt("desktop_height", DESKTOP_HEIGHT)
+        val dpi = desktopPrefs.getInt("desktop_dpi", DESKTOP_DPI)
+
         return interactor.createDisplay(
-            name = "Desktop 1080p",
-            width = DESKTOP_WIDTH,
-            height = DESKTOP_HEIGHT,
-            dpi = DESKTOP_DPI,
+            name = "Desktop ${width}x${height}",
+            width = width,
+            height = height,
+            dpi = dpi,
             flags = desktopFlags,
             desktopMode = true
         ).onSuccess { displayId ->

@@ -81,12 +81,25 @@ const video=document.getElementById('video');
 const wrap=document.getElementById('wrap');
 const cursor=document.getElementById('cursor');
 const status=document.getElementById('status');
+const bar=document.getElementById('bar');
 let pc=null;
 let expectedW=0, expectedH=0;
 let sourceW=0, sourceH=0;
 let rotated=false;
 
-function setStatus(s){status.textContent=s;console.log('[WebRTC]',s);}
+// 优化后的状态处理函数
+function setStatus(s){
+  status.textContent=s;
+  console.log('[WebRTC]',s);
+  // 当连接成功时隐藏状态栏，其他异常/加载状态则显示
+  if(s === 'connected' || s === 'PC: connected') {
+    bar.style.display = 'none';
+    // 隐藏状态栏后，留出时间让DOM更新，并重新计算视频画面的布局以铺满全屏
+    setTimeout(applyVideoLayout, 50); 
+  } else {
+    bar.style.display = 'flex';
+  }
+}
 
 function fitRect(aspect,w,h){
   if(!aspect || w<=0 || h<=0) return {w:0,h:0};
@@ -112,10 +125,6 @@ function applyVideoLayout(){
   if(r.w<=0 || r.h<=0) return;
 
   if(rotated){
-    // The decoder produces portrait-coded H264 while the selected virtual
-    // display is landscape. Lay out the pre-rotation buffer with swapped
-    // dimensions, then rotate it in the browser so the displayed rectangle
-    // is still exactly the virtual display's logical aspect ratio.
     video.style.width=r.h+'px';
     video.style.height=r.w+'px';
     video.style.transform='translate(-50%,-50%) rotate(90deg)';
@@ -132,8 +141,6 @@ function updateCursor(c){
   }
   const vr=video.getBoundingClientRect(), wr=wrap.getBoundingClientRect();
   if(vr.width<=0||vr.height<=0){cursor.style.display='none';return;}
-  // Browser cursor is optional; local Android uses its own overlay. For the
-  // Web page, map against the rotated visual rectangle rather than raw buffer.
   let nx=c.x/c.width, ny=c.y/c.height;
   if(rotated){
     const tx=nx, ty=ny;
