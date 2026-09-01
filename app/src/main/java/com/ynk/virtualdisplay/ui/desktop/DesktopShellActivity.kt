@@ -1,7 +1,6 @@
 package com.ynk.virtualdisplay.ui.desktop
 
 import android.content.Intent
-import android.content.pm.ResolveInfo
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.PixelFormat
@@ -15,11 +14,13 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.PopupWindow
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.lifecycle.lifecycleScope
 import com.ynk.virtualdisplay.domain.DisplayInteractor
+import com.ynk.virtualdisplay.data.repository.RecentAppHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -172,49 +173,93 @@ class DesktopShellActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Desktop dock app drawer. Keep this in sync with the normal-mode app drawer:
+     * use the daemon/RPC app list (not the phone's PackageManager), preserve
+     * recent-app ordering, and do not arbitrarily truncate the application list.
+     */
     private fun showAppLauncher(anchor: View) {
-        val pm = packageManager
-        val query = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val apps = pm.queryIntentActivities(query, 0)
-            .filter { it.activityInfo.packageName != packageName }
-            .sortedBy { it.loadLabel(pm).toString().lowercase() }
-
-        if (apps.isEmpty()) {
-            Toast.makeText(this, "没有可启动的应用", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val list = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            background = rounded(0xF0161A20.toInt(), 18f)
-        }
-        apps.take(24).forEach { info ->
-            val item = button(info.loadLabel(pm).toString()) {
-                launchExternalApp(info)
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) { displayInteractor.listApps() }
+            result.onFailure {
+                Toast.makeText(
+                    this@DesktopShellActivity,
+                    "获取应用列表失败：${it.message ?: "未知错误"}",
+                    Toast.LENGTH_LONG
+                ).show()
+                return@launch
             }
-            list.addView(item, LinearLayout.LayoutParams(dp(420), dp(54)).apply {
-                bottomMargin = dp(4)
-            })
-        }
 
-        PopupWindow(
-            list,
-            dp(440),
-            minOf(dp(850), resources.displayMetrics.heightPixels - dp(120)),
-            true
-        ).apply {
-            elevation = dp(18).toFloat()
-            isOutsideTouchable = true
-            showAtLocation(window.decorView, Gravity.BOTTOM or Gravity.START, dp(26), dp(94))
+            val apps = result.getOrDefault(emptyList())
+                .filter { it.packageName != packageName }
+            if (apps.isEmpty()) {
+                Toast.makeText(this@DesktopShellActivity, "没有可启动的应用", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+
+            val recent = RecentAppHelper.getRecentApps(this@DesktopShellActivity)
+            val recentSet = recent.toSet()
+            val recentList = apps.filter { it.packageName in recentSet }
+                .sortedBy { recent.indexOf(it.packageName).takeIf { idx -> idx >= 0 } ?: Int.MAX_VALUE }
+            val otherList = apps.filter { it.packageName !in recentSet }
+                .sortedBy { it.name.lowercase() }
+            val ordered = recentList + otherList
+
+            lateinit var popup: PopupWindow
+            val scroll = ScrollView(this@DesktopShellActivity).apply {
+                isVerticalScrollBarEnabled = true
+                overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                background = rounded(0xF0161A20.toInt(), 18f)
+            }
+            val list = LinearLayout(this@DesktopShellActivity).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            scroll.addView(list, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+
+            ordered.forEach { app ->
+                val isRecent = app.packageName in recentSet
+                val label = if (isRecent) "★  ${app.name}" else app.name
+                val item = button(label) {
+                    popup.dismiss()
+                    launchRemoteApp(app.packageName)
+                }
+                item.maxLines = 1
+                item.ellipsize = android.text.TextUtils.TruncateAt.END
+                item.gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                item.setPadding(dp(18), 0, dp(18), 0)
+                list.addView(item, LinearLayout.LayoutParams(dp(520), dp(54)).apply {
+                    bottomMargin = dp(5)
+                })
+            }
+
+            popup = PopupWindow(
+                scroll,
+                minOf(dp(560), resources.displayMetrics.widthPixels - dp(48)),
+                minOf(dp(850), resources.displayMetrics.heightPixels - dp(120)),
+                true
+            ).apply {
+                elevation = dp(18).toFloat()
+                isOutsideTouchable = true
+            }
+            popup.showAtLocation(
+                window.decorView,
+                Gravity.BOTTOM or Gravity.START,
+                dp(26),
+                dp(94)
+            )
         }
     }
 
-    private fun launchExternalApp(info: ResolveInfo) {
-        val packageName = info.activityInfo.packageName
+    private fun launchRemoteApp(packageName: String) {
         val displayId = desktopDisplayId
         lifecycleScope.launch(Dispatchers.IO) {
-            val existing = VirtualDisplayTaskManager.findTaskByPackage(this@DesktopShellActivity, displayId, packageName)
+            val existing = VirtualDisplayTaskManager.findTaskByPackage(
+                this@DesktopShellActivity, displayId, packageName
+            )
             if (existing != null && VirtualDisplayTaskManager.focusTask(existing.taskId)) {
                 return@launch
             }
@@ -229,10 +274,13 @@ class DesktopShellActivity : ComponentActivity() {
             }
 
             val result = displayInteractor.launchApp(packageName, displayId, freeform = false)
-            // ActivityManager may publish the new task slightly after startActivity returns.
             delay(300)
             withContext(Dispatchers.Main) {
-                result.onFailure {
+                result.onSuccess {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        RecentAppHelper.addRecentApp(this@DesktopShellActivity, packageName)
+                    }
+                }.onFailure {
                     Toast.makeText(
                         this@DesktopShellActivity,
                         "启动失败：${it.message ?: "daemon 拒绝启动"}",
