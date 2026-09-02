@@ -22,6 +22,8 @@ import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.widget.LinearLayout
+import android.graphics.drawable.GradientDrawable
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.core.view.WindowCompat
@@ -40,6 +42,7 @@ import kotlinx.coroutines.launch
 import org.koin.android.ext.android.inject
 import com.ynk.virtualdisplay.webrtc.GatewayProcessController
 import com.ynk.virtualdisplay.ui.desktop.VirtualDisplayTaskManager
+import com.ynk.virtualdisplay.ui.desktop.DesktopShellActivity
 
 @SuppressLint("ClickableViewAccessibility", "UseKtx")
 class DisplayActivity : ComponentActivity() {
@@ -807,6 +810,14 @@ class DisplayActivity : ComponentActivity() {
     private fun handleFourFingerGesture(event: MotionEvent) {
         when (event.actionMasked) {
             MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_MOVE, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP -> {
+                if (event.pointerCount >= 4) {
+                    // Explicitly cancel any deferred 2/3-finger click before the
+                    // 4-finger command is handled. This is the hard priority wall.
+                    if (::inputController.isInitialized) {
+                        inputController.cancelPendingMultiFingerClick()
+                    }
+                }
+
                 if (event.pointerCount >= 4 && !fourFingerGestureActive) {
                     fourFingerGestureActive = true
                     fourFingerGestureTriggered = false
@@ -818,6 +829,12 @@ class DisplayActivity : ComponentActivity() {
                     }
                     fourFingerStartX = sx / event.pointerCount
                     fourFingerStartY = sy / event.pointerCount
+
+                    // 4 fingers are a global desktop command layer. Route the
+                    // command to the DesktopShell that is actually running on
+                    // this virtual display. Never create UI on the physical
+                    // DisplayActivity window.
+                    remoteDisplayId?.let { DesktopShellActivity.showDockForDisplay(it) }
                 }
 
                 if (fourFingerGestureActive && !fourFingerGestureTriggered && event.pointerCount >= 4) {
@@ -875,6 +892,8 @@ class DisplayActivity : ComponentActivity() {
             fourFingerStartY = 0f
         }
     }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private fun isPointInsideView(rawX: Float, rawY: Float, view: View): Boolean {
         val location = IntArray(2)

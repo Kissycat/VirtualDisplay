@@ -22,10 +22,11 @@ import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.EditText
 import android.widget.ImageView
-import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.util.Log
+import android.widget.PopupWindow
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
@@ -43,6 +44,8 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.lang.reflect.Method
 import java.util.regex.Pattern
+import java.lang.ref.WeakReference
+import java.util.concurrent.ConcurrentHashMap
 import android.content.SharedPreferences
 
 /**
@@ -58,6 +61,25 @@ class DesktopShellActivity : ComponentActivity() {
         const val PREF_DESKTOP_WIDTH = "desktop_width"
         const val PREF_DESKTOP_HEIGHT = "desktop_height"
         const val PREF_DESKTOP_DPI = "desktop_dpi"
+
+        private val instances = ConcurrentHashMap<Int, WeakReference<DesktopShellActivity>>()
+
+        /**
+         * Show the EXISTING desktop Dock on the requested virtual display.
+         * The DisplayActivity is on the physical display, so it must never
+         * create a PopupWindow there. We route the command to the DesktopShell
+         * instance that is already running on the virtual display and move the
+         * very same Dock view into a display-local overlay window.
+         */
+        fun showDockForDisplay(displayId: Int) {
+            instances[displayId]?.get()?.let { activity ->
+                activity.runOnUiThread {
+                    if (!activity.isFinishing && !activity.isDestroyed) {
+                        activity.showDockOverlay()
+                    }
+                }
+            }
+        }
     }
 
     private val displayInteractor: DisplayInteractor by inject()
@@ -71,6 +93,9 @@ class DesktopShellActivity : ComponentActivity() {
     private var renderedTaskbarSignature: List<Int> = emptyList()
     @Volatile private var desktopWindowFocused = false
     private var desktopRoot: View? = null
+    private var desktopTaskbar: View? = null
+    private var dockOverlayWindowManager: WindowManager? = null
+    private var dockOverlayAttached = false
     private val desktopPrefs: SharedPreferences by lazy {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
     }
@@ -162,10 +187,12 @@ class DesktopShellActivity : ComponentActivity() {
         }
         taskbar.addView(clock, LinearLayout.LayoutParams(dp(90), dp(52)))
 
+        desktopTaskbar = taskbar
         root.addView(taskbar, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(68)
         ))
 
+        instances[desktopDisplayId] = WeakReference(this)
         setContentView(root)
     }
 
@@ -317,7 +344,8 @@ class DesktopShellActivity : ComponentActivity() {
                 isOutsideTouchable = true
             }
             popup.showAtLocation(
-                window.decorView,
+//                window.decorView,
+																anchor,                
                 Gravity.BOTTOM or Gravity.START,
                 dp(26),
                 dp(94)
@@ -377,8 +405,8 @@ class DesktopShellActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun refreshTaskbar() {
-        if (!desktopWindowFocused || !window.decorView.hasWindowFocus()) return
+    private suspend fun refreshTaskbar(allowWhenUnfocused: Boolean = false) {
+        if (!allowWhenUnfocused && (!desktopWindowFocused || !window.decorView.hasWindowFocus())) return
         val tasks = withContext(Dispatchers.IO) {
             VirtualDisplayTaskManager.findTasks(this@DesktopShellActivity, desktopDisplayId)
         }
@@ -401,7 +429,7 @@ class DesktopShellActivity : ComponentActivity() {
                     lifecycleScope.launch(Dispatchers.IO) {
                         if (!VirtualDisplayTaskManager.focusTask(task.taskId)) {
                             withContext(Dispatchers.Main) {
-                                Toast.makeText(this@DesktopShellActivity, "无法切换到 ${label}", Toast.LENGTH_SHORT).show()
+                                //Toast.makeText(this@DesktopShellActivity, "无法切换到 ${label}", Toast.LENGTH_SHORT).show()
                             }
                         }
                     }
@@ -559,7 +587,7 @@ class DesktopShellActivity : ComponentActivity() {
                     val caption = TextView(this@DesktopShellActivity).apply {
                         text = label.removePrefix("★  ")
                         setTextColor(Color.WHITE)
-                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
                         maxLines = 1
                         ellipsize = android.text.TextUtils.TruncateAt.END
                         gravity = Gravity.CENTER
@@ -687,7 +715,93 @@ class DesktopShellActivity : ComponentActivity() {
     override fun onDestroy() {
         taskbarMonitorJob?.cancel()
         decorationJob?.cancel()
+        hideDockOverlay()
+        instances.remove(desktopDisplayId)?.let { ref ->
+            if (ref.get() === this) instances.remove(desktopDisplayId)
+        }
         super.onDestroy()
+    }
+
+    /**
+     * Show the existing desktop taskbar over the foreground app on THIS
+     * virtual display. The view itself is not duplicated or rebuilt.
+     */
+    private fun showDockOverlay() {
+        val dock = desktopTaskbar ?: return
+        if (dockOverlayAttached) {
+            dock.visibility = View.VISIBLE
+            lifecycleScope.launch { refreshTaskbar(allowWhenUnfocused = true) }
+            return
+        }
+
+        val parent = dock.parent as? ViewGroup
+        parent?.removeView(dock)
+
+        // DesktopShellActivity itself is hosted by the target virtual display.
+        // Still derive the WindowManager from that exact Display so the overlay
+        // cannot accidentally land on the physical/default display.
+        val targetDisplay = display ?: return
+        val displayContext = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            createDisplayContext(targetDisplay).createWindowContext(
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null
+            )
+        } else {
+            createDisplayContext(targetDisplay)
+        }
+        val wm = displayContext.getSystemService(WindowManager::class.java) ?: return
+        val params = WindowManager.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(68),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+																WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            x = 0
+            y = 0
+            title = "VirtualDisplayDesktopDock-$desktopDisplayId"
+        }
+
+								dock.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_OUTSIDE) {
+                hideDockOverlay()
+                true
+            } else {
+                false
+            }
+        }
+
+        runCatching {
+            wm.addView(dock, params)
+            dockOverlayWindowManager = wm
+            dockOverlayAttached = true
+            dock.visibility = View.VISIBLE
+            lifecycleScope.launch { refreshTaskbar(allowWhenUnfocused = true) }
+        }.onFailure {
+            // Restore the exact same Dock view to the desktop root if the
+            // display-local overlay cannot be attached.
+            parent?.addView(dock, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(68)
+            ))
+            Log.w("DesktopShellActivity", "Failed to show virtual-display Dock overlay", it)
+        }
+    }
+
+    private fun hideDockOverlay() {
+        val dock = desktopTaskbar ?: return
+        if (!dockOverlayAttached) return
+								dock.setOnTouchListener(null)
+        runCatching { dockOverlayWindowManager?.removeViewImmediate(dock) }
+        dockOverlayWindowManager = null
+        dockOverlayAttached = false
+        val root = desktopRoot as? ViewGroup
+        if (dock.parent == null && root != null) {
+            root.addView(dock, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(68)
+            ))
+        }
     }
 
     private fun button(text: String, onClick: () -> Unit): TextView = TextView(this).apply {
