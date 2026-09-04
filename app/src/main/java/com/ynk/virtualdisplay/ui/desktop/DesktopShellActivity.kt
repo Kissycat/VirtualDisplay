@@ -608,8 +608,8 @@ class DesktopShellActivity : ComponentActivity() {
     }
 
     private fun showDecoration(packageName: String) {
-        if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "缺少悬浮窗权限，无法显示窗口控制条", Toast.LENGTH_SHORT).show()
+								if (!ensureOverlayPermissionSilently()) {
+            Toast.makeText(this, "缺少悬浮窗权限且 Shizuku 未就绪，无法显示窗口控制条", Toast.LENGTH_SHORT).show()
             return
         }
         currentTargetPackage = packageName
@@ -637,6 +637,27 @@ class DesktopShellActivity : ComponentActivity() {
                 delay(250)
             }
         }
+    }
+
+				private fun ensureOverlayPermissionSilently(): Boolean {
+        // 如果已经有权限，直接返回 true
+        if (Settings.canDrawOverlays(this)) {
+            return true
+        }
+
+        // 如果没有权限但 Shizuku 可用，尝试通过 appops 自动提权
+        if (Shizuku.pingBinder()) {
+            runCatching {
+                runShizuku("appops set $packageName SYSTEM_ALERT_WINDOW allow")
+            }.onFailure {
+                Log.e("DesktopShell", "Shizuku 自动赋予悬浮窗权限失败", it)
+            }
+
+            // 再次检查权限是否赋予成功
+            return Settings.canDrawOverlays(this)
+        }
+
+        return false
     }
 
     internal fun findTargetTask(packageName: String): TaskInfo? =
@@ -731,6 +752,11 @@ class DesktopShellActivity : ComponentActivity() {
         if (dockOverlayAttached) {
             dock.visibility = View.VISIBLE
             lifecycleScope.launch { refreshTaskbar(allowWhenUnfocused = true) }
+            return
+        }
+
+								if (!ensureOverlayPermissionSilently()) {
+            Toast.makeText(this, "需要悬浮窗权限，请确保 Shizuku 已激活", Toast.LENGTH_SHORT).show()
             return
         }
 
