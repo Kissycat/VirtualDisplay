@@ -53,6 +53,9 @@ object VirtualDisplayTaskManager {
     fun findTaskByPackage(context: Context, displayId: Int, packageName: String): TaskInfo? =
         findTasks(context, displayId).firstOrNull { it.packageName == packageName }
 
+    fun findTaskById(context: Context, displayId: Int, taskId: Int): TaskInfo? =
+        findTasks(context, displayId).firstOrNull { it.taskId == taskId }
+
     /** Find an existing task for a package that currently lives on another display. */
     fun findTaskOnOtherDisplay(context: Context, targetDisplayId: Int, packageName: String): TaskInfo? {
         if (targetDisplayId < 0 || !Shizuku.pingBinder()) return null
@@ -124,6 +127,34 @@ object VirtualDisplayTaskManager {
             Math.floorMod(currentIndex + if (direction >= 0) 1 else -1, tasks.size)
         } else if (direction >= 0) 0 else tasks.lastIndex
         return focusTask(tasks[index].taskId)
+    }
+
+    /** Kill an app using Shizuku; all privileged process/task termination stays
+     * on the Shizuku side rather than calling Activity APIs from the app. */
+    fun forceStopPackage(packageName: String): Boolean {
+        if (packageName.isBlank() || !Shizuku.pingBinder()) return false
+        return runCatching {
+            val output = runShizuku("am force-stop '${quoteArg(packageName)}' >/dev/null 2>&1; echo \\$?").trim()
+            val ok = output.lineSequence().lastOrNull()?.trim() == "0"
+            if (!ok) Log.w(TAG, "forceStopPackage($packageName) failed: $output")
+            ok
+        }.getOrElse {
+            Log.w(TAG, "forceStopPackage($packageName) failed", it)
+            false
+        }
+    }
+
+    fun removeTask(taskId: Int): Boolean {
+        if (taskId <= 0 || !Shizuku.pingBinder()) return false
+        return runCatching {
+            val output = runShizuku("am task remove $taskId >/dev/null 2>&1; echo \\$?").trim()
+            val ok = output.lineSequence().lastOrNull()?.trim() == "0"
+            if (!ok) Log.w(TAG, "removeTask($taskId) failed: $output")
+            ok
+        }.getOrElse {
+            Log.w(TAG, "removeTask($taskId) failed", it)
+            false
+        }
     }
 
     fun focusTask(taskId: Int): Boolean {

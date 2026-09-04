@@ -2,6 +2,7 @@ package com.ynk.virtualdisplay.ui.desktop
 
 import android.content.Intent
 import android.app.AlertDialog
+import android.app.ActivityOptions
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -9,6 +10,7 @@ import android.graphics.Paint
 import android.net.Uri
 import android.graphics.Color
 import android.graphics.Rect
+import android.graphics.drawable.Drawable
 import android.graphics.PixelFormat
 import android.os.Bundle
 import android.util.TypedValue
@@ -20,6 +22,7 @@ import android.provider.Settings
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
+import android.widget.FrameLayout
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.ScrollView
@@ -27,6 +30,12 @@ import android.widget.TextView
 import android.widget.Toast
 import android.util.Log
 import android.widget.PopupWindow
+import android.widget.BaseAdapter
+import android.widget.ListView
+import android.widget.GridView
+import android.content.pm.LauncherApps
+import android.content.pm.ShortcutInfo
+import android.content.pm.LauncherApps.ShortcutQuery
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
@@ -46,6 +55,7 @@ import java.lang.reflect.Method
 import java.util.regex.Pattern
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
+import java.util.LinkedHashSet
 import android.content.SharedPreferences
 
 /**
@@ -82,17 +92,26 @@ class DesktopShellActivity : ComponentActivity() {
         }
     }
 
-    private val displayInteractor: DisplayInteractor by inject()
+    internal val displayInteractor: DisplayInteractor by inject()
     // Retained only for backward-compatible helper code; Freeform decoration is no longer started.
-    private var decoration: FreeformOverlayDecoration? = null
-    private var decorationJob: Job? = null
-    private var currentTargetPackage: String = ""
-    private var desktopDisplayId: Int = Display.DEFAULT_DISPLAY
+    private val desktopWindows = LinkedHashSet<FreeformOverlayDecoration>()
+    internal var desktopDisplayId: Int = Display.DEFAULT_DISPLAY
     private var taskbarAppsContainer: LinearLayout? = null
     private var taskbarMonitorJob: Job? = null
     private var renderedTaskbarSignature: List<Int> = emptyList()
+    private var cachedDrawerApps: List<com.ynk.virtualdisplay.protocol.DeviceMessage.AppEntry> = emptyList()
+    private var cachedDrawerAppsAt: Long = 0L
+    private var cachedRecentPackages: List<String> = emptyList()
+    private var cachedRecentPackagesAt: Long = 0L
+    private var drawerOverlayWindowManager: WindowManager? = null
+    private var drawerOverlayRoot: FrameLayout? = null
+    private var drawerOverlayParams: WindowManager.LayoutParams? = null
+    private var drawerExpanded = false
+    private var drawerLastHoverY = Float.NaN
+    private var drawerLastHoverX = Float.NaN
     @Volatile private var desktopWindowFocused = false
     private var desktopRoot: View? = null
+    private var desktopWindowLayer: FrameLayout? = null
     private var desktopTaskbar: View? = null
     private var dockOverlayWindowManager: WindowManager? = null
     private var dockOverlayAttached = false
@@ -140,6 +159,17 @@ class DesktopShellActivity : ComponentActivity() {
         }
         desktopRoot = root
 
+        // All freeform decorations live inside the DesktopShell view hierarchy.
+        // This guarantees they are rendered on the same virtual display and
+        // avoids cross-window token/display issues on MIUI.
+        val windowLayer = FrameLayout(this).apply {
+            clipChildren = false
+            clipToPadding = false
+            isClickable = false
+            isFocusable = false
+        }
+        desktopWindowLayer = windowLayer
+
         val spacer = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
@@ -156,7 +186,7 @@ class DesktopShellActivity : ComponentActivity() {
         }
 
         lateinit var launcher: TextView
-        launcher = button("☰  应用") { showAppLauncher(launcher) }
+        launcher = button("☰  应用") { showAppLauncher() }
         taskbar.addView(launcher, LinearLayout.LayoutParams(dp(150), dp(52)).apply {
             marginEnd = dp(10)
         })
@@ -193,9 +223,65 @@ class DesktopShellActivity : ComponentActivity() {
         ))
 
         instances[desktopDisplayId] = WeakReference(this)
-        setContentView(root)
+
+        // Shell content is the background/taskbar; the window layer is drawn
+        // over it so desktop windows can overlap the taskbar/background just
+        // like LMO's decoration layer.
+        val shell = FrameLayout(this).apply {
+            clipChildren = false
+            clipToPadding = false
+        }
+        shell.addView(root, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+        shell.addView(windowLayer, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+        setContentView(shell)
     }
 
+    internal fun addDesktopWindowView(view: View, width: Int, height: Int, x: Int, y: Int) {
+        val layer = desktopWindowLayer ?: return
+        if (view.parent == layer) return
+        view.layoutParams = FrameLayout.LayoutParams(width, height).apply {
+            leftMargin = x
+            topMargin = y
+        }
+        layer.addView(view)
+        view.bringToFront()
+    }
+
+    internal fun updateDesktopWindowView(view: View, width: Int, height: Int, x: Int, y: Int) {
+        val lp = view.layoutParams as? FrameLayout.LayoutParams ?: return
+        lp.width = width
+        lp.height = height
+        lp.leftMargin = x
+        lp.topMargin = y
+        view.layoutParams = lp
+    }
+
+    internal fun bringDesktopWindowToFront(view: View) {
+        if (view.parent === desktopWindowLayer) view.bringToFront()
+    }
+
+    internal fun removeDesktopWindowView(view: View) {
+        val layer = desktopWindowLayer
+        if (layer != null && view.parent === layer) layer.removeView(view)
+    }
+
+
+    internal fun desktopDpiPublic(): Int = desktopPrefs.getInt(PREF_DESKTOP_DPI, 160)
+
+    override fun onDestroy() {
+        // Release desktop-window resources before the shell Activity goes away.
+        closeAppDrawer()
+        taskbarMonitorJob?.cancel()
+        taskbarMonitorJob = null
+        desktopWindows.toList().forEach { runCatching { it.remove() } }
+        desktopWindows.clear()
+        instances.remove(desktopDisplayId)
+        super.onDestroy()
+    }
 
     override fun onResume() {
         super.onResume()
@@ -213,8 +299,10 @@ class DesktopShellActivity : ComponentActivity() {
 
     override fun onPause() {
         desktopWindowFocused = false
-        taskbarMonitorJob?.cancel()
-        taskbarMonitorJob = null
+        if (!dockOverlayAttached) {
+            taskbarMonitorJob?.cancel()
+            taskbarMonitorJob = null
+        }
         super.onPause()
     }
 
@@ -234,6 +322,7 @@ class DesktopShellActivity : ComponentActivity() {
         }
     }
 
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         // The virtual display launches this Activity as its HOME task. Reassert
@@ -252,105 +341,246 @@ class DesktopShellActivity : ComponentActivity() {
      * use the daemon/RPC app list (not the phone's PackageManager), preserve
      * recent-app ordering, and do not arbitrarily truncate the application list.
      */
-    private fun showAppLauncher(anchor: View) {
-        lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) { displayInteractor.listApps() }
-            result.onFailure {
-                Toast.makeText(
-                    this@DesktopShellActivity,
-                    "获取应用列表失败：${it.message ?: "未知错误"}",
-                    Toast.LENGTH_LONG
-                ).show()
-                return@launch
-            }
+    private fun showAppLauncher() {
+        if (isFinishing || isDestroyed || drawerOverlayRoot != null) return
+        if (!ensureOverlayPermissionSilently()) return
+        val targetDisplay = display ?: return
+        val displayContext = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            createDisplayContext(targetDisplay).createWindowContext(
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null
+            )
+        } else {
+            createDisplayContext(targetDisplay)
+        }
+        val wm = displayContext.getSystemService(WindowManager::class.java) ?: return
 
-            val apps = result.getOrDefault(emptyList())
-                .filter { it.packageName != packageName }
-            if (apps.isEmpty()) {
-                Toast.makeText(this@DesktopShellActivity, "没有可启动的应用", Toast.LENGTH_SHORT).show()
-                return@launch
-            }
+        val fullWidth = minOf(dp(580), targetDisplay.width - dp(32)).coerceAtLeast(dp(320))
+        val rowHeight = dp(84)
+        val fullHeight = minOf(dp(850), targetDisplay.height - dp(120)).coerceAtLeast(rowHeight)
 
-            val recent = RecentAppHelper.getRecentApps(this@DesktopShellActivity)
-            val recentSet = recent.toSet()
-            val recentList = apps.filter { it.packageName in recentSet }
-                .sortedBy { recent.indexOf(it.packageName).takeIf { idx -> idx >= 0 } ?: Int.MAX_VALUE }
-            val otherList = apps.filter { it.packageName !in recentSet }
-                .sortedBy { it.name.lowercase() }
-            val ordered = recentList + otherList
+        val container = FrameLayout(displayContext).apply {
+            background = roundedPublic(0xF0161A20.toInt(), 20f)
+            clipChildren = true
+            clipToPadding = true
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+        }
+        val recentRow = LinearLayout(displayContext).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(2), 0, dp(2), 0)
+        }
+        val scroll = android.widget.HorizontalScrollView(displayContext).apply {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(recentRow, ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, rowHeight - dp(12)))
+        }
+        container.addView(scroll, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, rowHeight - dp(12), Gravity.TOP
+        ))
 
-            lateinit var popup: PopupWindow
-            val scroll = ScrollView(this@DesktopShellActivity).apply {
-                isVerticalScrollBarEnabled = true
-                overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-                setPadding(dp(8), dp(8), dp(8), dp(8))
-                background = rounded(0xF0161A20.toInt(), 18f)
+        fun addRecentItem(pkg: String, index: Int) {
+            val item = createAppItem(pkg, runCatching {
+                packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+            }.getOrElse { pkg.substringAfterLast('.') }, compact = true) {
+                closeAppDrawer()
+                launchRemoteApp(pkg)
             }
-            val list: ViewGroup = if (showAppIcons()) {
-                android.widget.GridLayout(this@DesktopShellActivity).apply {
-                    columnCount = 5
-                    useDefaultMargins = false
-                    alignmentMode = android.widget.GridLayout.ALIGN_MARGINS
-                    setPadding(dp(8), dp(8), dp(8), dp(8))
+            recentRow.addView(item, LinearLayout.LayoutParams(
+                if (showAppIcons()) dp(62) else dp(160), rowHeight - dp(18)
+            ).apply { marginEnd = dp(6) })
+        }
+
+        val recent = cachedRecentPackages.distinct().filter { it != packageName }
+        if (recent.isEmpty()) {
+            recentRow.addView(TextView(displayContext).apply {
+                text = "最近应用"
+                setTextColor(0xFFCBD2DC.toInt())
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), 0, dp(12), 0)
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        } else {
+            recent.take(12).forEachIndexed { index, pkg -> addRecentItem(pkg, index) }
+        }
+
+        val params = WindowManager.LayoutParams(
+            fullWidth,
+            rowHeight,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.START
+            x = dp(26)
+            y = dp(94)
+            title = "VirtualDisplayDesktopAppDrawer-$desktopDisplayId"
+        }
+
+        drawerExpanded = false
+        drawerLastHoverX = Float.NaN
+        drawerLastHoverY = Float.NaN
+        drawerOverlayRoot = container
+        drawerOverlayWindowManager = wm
+        drawerOverlayParams = params
+
+        fun expandDrawer() {
+            if (drawerExpanded || drawerOverlayRoot == null) return
+            drawerExpanded = true
+            params.height = fullHeight
+            runCatching { wm.updateViewLayout(container, params) }
+            populateFullDrawer(container, fullWidth, fullHeight)
+        }
+
+        fun leftThroughTopEdge(event: MotionEvent): Boolean {
+            if (drawerExpanded) return false
+            val topSlop = dp(10).toFloat()
+            val lastY = if (drawerLastHoverY.isNaN()) event.y else drawerLastHoverY
+            val currentY = event.y
+            // Expand only when the pointer leaves through the TOP edge. Do not
+            // expand for side/bottom exit, ACTION_OUTSIDE, or a simple click.
+            return lastY <= topSlop && currentY <= topSlop
+        }
+
+        container.setOnHoverListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_HOVER_ENTER -> {
+                    drawerLastHoverX = event.x
+                    drawerLastHoverY = event.y
                 }
-            } else {
-                LinearLayout(this@DesktopShellActivity).apply {
-                    orientation = LinearLayout.VERTICAL
+                MotionEvent.ACTION_HOVER_EXIT -> {
+                    val shouldExpand = leftThroughTopEdge(event)
+                    Log.d("DesktopDrawer", "HOVER_EXIT x=${event.x} y=${event.y} lastY=$drawerLastHoverY expand=$shouldExpand")
+                    if (shouldExpand) expandDrawer()
+                    drawerLastHoverX = Float.NaN
+                    drawerLastHoverY = Float.NaN
+                }
+                MotionEvent.ACTION_OUTSIDE -> {
+                    Log.d("DesktopDrawer", "HOVER_OUTSIDE ignored in collapsed drawer")
                 }
             }
-            scroll.addView(list, ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ))
+            false
+        }
+        container.setOnGenericMotionListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_HOVER_ENTER -> {
+                    drawerLastHoverX = event.x
+                    drawerLastHoverY = event.y
+                    false
+                }
+                MotionEvent.ACTION_HOVER_EXIT -> {
+                    val shouldExpand = leftThroughTopEdge(event)
+                    Log.d("DesktopDrawer", "GENERIC_HOVER_EXIT x=${event.x} y=${event.y} lastY=$drawerLastHoverY expand=$shouldExpand")
+                    if (shouldExpand) expandDrawer()
+                    drawerLastHoverX = Float.NaN
+                    drawerLastHoverY = Float.NaN
+                    true
+                }
+                else -> false
+            }
+        }
+        container.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_OUTSIDE) {
+                Log.d("DesktopDrawer", "TOUCH_OUTSIDE expanded=$drawerExpanded")
+                closeAppDrawer()
+                true
+            } else false
+        }
 
-            ordered.forEach { app ->
-                val isRecent = app.packageName in recentSet
-                val item = createAppItem(
-                    packageName = app.packageName,
-                    label = if (isRecent) "★  ${app.name}" else app.name,
-                    compact = false,
-                ) {
-                    popup.dismiss()
+        runCatching { wm.addView(container, params) }
+            .onFailure {
+                drawerOverlayRoot = null
+                drawerOverlayWindowManager = null
+                drawerOverlayParams = null
+                Log.w("DesktopShell", "Failed to show app drawer overlay", it)
+            }
+
+        // Recent row is cache-only. Start loading the full app list in the background.
+        lifecycleScope.launch(Dispatchers.IO) {
+            val cacheFresh = cachedDrawerApps.isNotEmpty() && System.currentTimeMillis() - cachedDrawerAppsAt < 30_000L
+            if (!cacheFresh) {
+                val result = displayInteractor.listApps()
+                result.onSuccess {
+                    cachedDrawerApps = it
+                    cachedDrawerAppsAt = System.currentTimeMillis()
+                }
+            }
+        }
+    }
+
+    private fun populateFullDrawer(container: FrameLayout, drawerWidth: Int, drawerHeight: Int) {
+        val existing = container.getChildAt(1)
+        if (existing != null) {
+            container.removeViewAt(1)
+        }
+        val apps = cachedDrawerApps.filter { it.packageName != packageName }
+        if (apps.isEmpty()) {
+            container.addView(TextView(container.context).apply {
+                text = "正在加载应用…"
+                setTextColor(0xFFCBD2DC.toInt())
+                gravity = Gravity.CENTER
+            }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, drawerHeight - dp(92), Gravity.TOP).apply {
+                topMargin = dp(86)
+            })
+            lifecycleScope.launch {
+                val result = withContext(Dispatchers.IO) { displayInteractor.listApps() }
+                result.onSuccess {
+                    cachedDrawerApps = it
+                    cachedDrawerAppsAt = System.currentTimeMillis()
+                    if (drawerOverlayRoot === container && drawerExpanded) {
+                        populateFullDrawer(container, drawerWidth, drawerHeight)
+                    }
+                }
+            }
+            return
+        }
+        val recentSet = cachedRecentPackages.toSet()
+        val ordered = apps.sortedWith(compareByDescending<com.ynk.virtualdisplay.protocol.DeviceMessage.AppEntry> { it.packageName in recentSet }.thenBy { it.name.lowercase() })
+        val adapter = object : BaseAdapter() {
+            override fun getCount() = ordered.size
+            override fun getItem(position: Int) = ordered[position]
+            override fun getItemId(position: Int) = position.toLong()
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val app = ordered[position]
+                val recent = app.packageName in recentSet
+                return createAppItem(app.packageName, if (recent) "★  ${app.name}" else app.name, compact = false) {
+                    closeAppDrawer()
                     launchRemoteApp(app.packageName)
                 }
-                if (showAppIcons()) {
-                    val lp = android.widget.GridLayout.LayoutParams().apply {
-                        width = dp(104)
-                        height = dp(116)
-                        setMargins(dp(4), dp(4), dp(4), dp(4))
-                    }
-                    list.addView(item, lp)
-                } else {
-                    list.addView(item, LinearLayout.LayoutParams(dp(520), dp(54)).apply {
-                        bottomMargin = dp(5)
-                    })
-                }
             }
-
-            val drawerWidth = if (showAppIcons()) {
-                // Five cells of 104dp + 4dp margins on both sides + 8dp content padding.
-                // Keep the popup just wide enough for five columns without clipping.
-                minOf(dp(580), resources.displayMetrics.widthPixels - dp(32))
-            } else {
-                minOf(dp(560), resources.displayMetrics.widthPixels - dp(48))
-            }
-            popup = PopupWindow(
-                scroll,
-                drawerWidth,
-                minOf(dp(850), resources.displayMetrics.heightPixels - dp(120)),
-                true
-            ).apply {
-                elevation = dp(18).toFloat()
-                isOutsideTouchable = true
-            }
-            popup.showAtLocation(
-//                window.decorView,
-																anchor,                
-                Gravity.BOTTOM or Gravity.START,
-                dp(26),
-                dp(94)
-            )
         }
+        val list: View = if (showAppIcons()) {
+            GridView(this).apply {
+                numColumns = 5
+                horizontalSpacing = dp(4)
+                verticalSpacing = dp(4)
+                columnWidth = dp(104)
+                stretchMode = GridView.NO_STRETCH
+                this.adapter = adapter
+                setPadding(dp(6), dp(6), dp(6), dp(6))
+                clipToPadding = false
+            }
+        } else {
+            ListView(this).apply {
+                divider = null
+                dividerHeight = dp(4)
+                this.adapter = adapter
+                setPadding(dp(6), dp(6), dp(6), dp(6))
+                clipToPadding = false
+            }
+        }
+        container.addView(list, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, drawerHeight - dp(92), Gravity.TOP
+        ).apply { topMargin = dp(86) })
+    }
+
+    private fun closeAppDrawer() {
+        val root = drawerOverlayRoot ?: return
+        runCatching { drawerOverlayWindowManager?.removeViewImmediate(root) }
+        drawerOverlayWindowManager = null
+        drawerOverlayRoot = null
+        drawerOverlayParams = null
+        drawerExpanded = false
     }
 
     private fun launchRemoteApp(packageName: String) {
@@ -391,49 +621,58 @@ class DesktopShellActivity : ComponentActivity() {
         }
     }
 
+    internal fun migrateDesktopWindowToMainDisplay(packageName: String) {
+        if (isFinishing || isDestroyed) return
+        launchRemoteApp(packageName)
+    }
+
     private fun startTaskbarMonitor() {
         taskbarMonitorJob?.cancel()
         taskbarMonitorJob = lifecycleScope.launch {
             delay(2000)
-            while (isActive && desktopWindowFocused && !isFinishing && !isDestroyed) {
-                if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) &&
-                    window.decorView.hasWindowFocus()) {
-                    refreshTaskbar()
+            while (isActive && (desktopWindowFocused || dockOverlayAttached) && !isFinishing && !isDestroyed) {
+                if (dockOverlayAttached || (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) &&
+                    window.decorView.hasWindowFocus())) {
+                    refreshTaskbar(allowWhenUnfocused = dockOverlayAttached)
                 }
                 delay(2000)
             }
         }
     }
 
-    private suspend fun refreshTaskbar(allowWhenUnfocused: Boolean = false) {
-        if (!allowWhenUnfocused && (!desktopWindowFocused || !window.decorView.hasWindowFocus())) return
-        val tasks = withContext(Dispatchers.IO) {
+    internal suspend fun refreshTaskbar(allowWhenUnfocused: Boolean = false) {
+        if (!allowWhenUnfocused && (!desktopWindowFocused && !dockOverlayAttached)) return
+        val now = System.currentTimeMillis()
+        val taskSnapshot = withContext(Dispatchers.IO) {
             VirtualDisplayTaskManager.findTasks(this@DesktopShellActivity, desktopDisplayId)
+                .filter { it.packageName != packageName }
+        }
+        if (now - cachedRecentPackagesAt > 5_000L) {
+            val recent = withContext(Dispatchers.IO) {
+                runCatching { RecentAppHelper.getRecentApps(this@DesktopShellActivity) }.getOrDefault(emptyList())
+            }
+            cachedRecentPackages = recent
+            cachedRecentPackagesAt = now
         }
         withContext(Dispatchers.Main) {
             val container = taskbarAppsContainer ?: return@withContext
-            val signature = tasks.map { it.taskId }
-            if (signature == renderedTaskbarSignature) return@withContext
-            renderedTaskbarSignature = signature
             container.removeAllViews()
-            val pm = packageManager
-            tasks.forEach { task ->
-                val label = runCatching {
-                    pm.getApplicationInfo(task.packageName, 0).loadLabel(pm).toString()
-                }.getOrDefault(task.packageName)
+            val shown = LinkedHashSet<String>()
+            taskSnapshot.forEach { task ->
+                if (!shown.add(task.packageName)) return@forEach
                 val item = createAppItem(
                     packageName = task.packageName,
-                    label = label,
-                    compact = true,
-                ) {
-                    lifecycleScope.launch(Dispatchers.IO) {
-                        if (!VirtualDisplayTaskManager.focusTask(task.taskId)) {
-                            withContext(Dispatchers.Main) {
-                                //Toast.makeText(this@DesktopShellActivity, "无法切换到 ${label}", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    }
-                }
+                    label = runCatching { packageManager.getApplicationLabel(packageManager.getApplicationInfo(task.packageName, 0)).toString() }
+                        .getOrElse { task.packageName.substringAfterLast('.') },
+                    compact = true
+                ) { VirtualDisplayTaskManager.focusTask(task.taskId) }
+                container.addView(item, LinearLayout.LayoutParams(
+                    if (showAppIcons()) dp(58) else dp(150), dp(48)
+                ).apply { marginEnd = dp(6) })
+            }
+            desktopWindows.filter { it.isVisible() }.forEach { win ->
+                if (!shown.add(win.packageName)) return@forEach
+                val item = createAppItem(packageName = win.packageName, label = win.displayLabel, compact = true) { win.bringToFront() }
                 container.addView(item, LinearLayout.LayoutParams(
                     if (showAppIcons()) dp(58) else dp(150), dp(48)
                 ).apply { marginEnd = dp(6) })
@@ -568,6 +807,7 @@ class DesktopShellActivity : ComponentActivity() {
                 ellipsize = android.text.TextUtils.TruncateAt.END
                 gravity = Gravity.CENTER_VERTICAL or Gravity.START
                 setPadding(if (compact) dp(10) else dp(18), 0, dp(10), 0)
+                installAppContextGesture(this, packageName)
             }
         } else {
             LinearLayout(this).apply {
@@ -575,7 +815,9 @@ class DesktopShellActivity : ComponentActivity() {
                 gravity = Gravity.CENTER
                 background = rounded(0x401F242C.toInt(), 14f)
                 isClickable = true
+                isLongClickable = true
                 setOnClickListener { onClick() }
+                installAppContextGesture(this, packageName)
                 val icon = ImageView(this@DesktopShellActivity).apply {
                     setImageDrawable(loadAppIcon(packageName))
                     scaleType = ImageView.ScaleType.CENTER_INSIDE
@@ -601,152 +843,328 @@ class DesktopShellActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Mirrors Launcher3's app icon interaction model: long-press or secondary mouse
+     * click opens a context menu that combines the app's published shortcuts with
+     * desktop actions. The popup is anchored to this Activity, so it stays on the
+     * same virtual display rather than creating a physical-display overlay.
+     */
+    private fun installAppContextGesture(view: View, pkg: String) {
+        view.isLongClickable = true
+        view.setOnLongClickListener {
+            showAppShortcutMenu(view, pkg)
+            true
+        }
+        view.setOnContextClickListener {
+            showAppShortcutMenu(view, pkg)
+            true
+        }
+        view.setOnGenericMotionListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS &&
+                (event.buttonState and MotionEvent.BUTTON_SECONDARY) != 0
+            ) {
+                showAppShortcutMenu(view, pkg)
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    private fun showAppShortcutMenu(anchor: View, pkg: String) {
+        lifecycleScope.launch {
+            val shortcuts = withContext(Dispatchers.IO) { queryPublishedShortcuts(pkg) }
+            lateinit var popup: PopupWindow
+            val popupContent = LinearLayout(this@DesktopShellActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                background = rounded(0xF0161A20.toInt(), 18f)
+                minimumWidth = dp(360)
+            }
+
+            val header = LinearLayout(this@DesktopShellActivity).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8), dp(4), dp(8), dp(8))
+            }
+            val appIcon = ImageView(this@DesktopShellActivity).apply {
+                setImageDrawable(loadAppIcon(pkg))
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+            }
+            header.addView(appIcon, LinearLayout.LayoutParams(dp(42), dp(42)))
+            val title = TextView(this@DesktopShellActivity).apply {
+                text = appLabel(pkg)
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(10), 0, 0, 0)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            }
+            header.addView(title, LinearLayout.LayoutParams(0, dp(42), 1f))
+            popupContent.addView(header)
+
+            addContextAction(popupContent, "打开", loadAppIcon(pkg)) {
+                popup.dismiss()
+                launchRemoteApp(pkg)
+            }
+            addContextAction(popupContent, "在自由窗口打开", android.R.drawable.ic_menu_view) {
+                popup.dismiss()
+                launchRemoteAppFreeform(pkg)
+            }
+
+            if (shortcuts.isNotEmpty()) {
+                addContextSeparator(popupContent)
+                val caption = TextView(this@DesktopShellActivity).apply {
+                    text = "应用快捷方式"
+                    setTextColor(0xFFB8C0CC.toInt())
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    setPadding(dp(10), dp(6), dp(10), dp(4))
+                }
+                popupContent.addView(caption)
+                shortcuts.forEach { si ->
+                    val text = si.shortLabel?.toString()?.takeIf { it.isNotBlank() }
+                        ?: si.longLabel?.toString()?.takeIf { it.isNotBlank() }
+                        ?: si.id
+                    val icon: Drawable? = runCatching {
+                        val launcherApps = getSystemService(LauncherApps::class.java)
+                        launcherApps?.getShortcutIconDrawable(si, resources.displayMetrics.densityDpi)
+                    }.getOrNull()
+                    addContextAction(popupContent, text, icon ?: loadAppIcon(pkg)) {
+                        popup.dismiss()
+                        launchPublishedShortcut(si)
+                    }
+                }
+            }
+
+            addContextSeparator(popupContent)
+            addContextAction(popupContent, "关闭应用", android.R.drawable.ic_menu_close_clear_cancel) {
+                popup.dismiss()
+                closeAppTask(pkg)
+            }
+            addContextAction(popupContent, "应用信息", android.R.drawable.ic_menu_info_details) {
+                popup.dismiss()
+                showAppInfo(pkg)
+            }
+
+            popup = PopupWindow(
+                popupContent,
+                minOf(dp(430), targetDisplayWidthForPopup() - dp(32)),
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                true
+            ).apply {
+                elevation = dp(32).toFloat()
+                isOutsideTouchable = true
+                inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                    setWindowLayoutType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
+                }
+                setClippingEnabled(false)
+                popupContent.elevation = dp(32).toFloat()
+            }
+
+            popupContent.measure(
+                View.MeasureSpec.makeMeasureSpec(minOf(dp(430), targetDisplayWidthForPopup() - dp(32)), View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(dp(1200), View.MeasureSpec.AT_MOST)
+            )
+            val loc = IntArray(2)
+            anchor.getLocationOnScreen(loc)
+            val popupWidth = popupContent.measuredWidth.coerceAtLeast(1)
+            val popupHeight = popupContent.measuredHeight.coerceAtLeast(1)
+            val screenWidth = desktopWindowLayer?.width?.takeIf { it > 0 } ?: targetDisplayWidthForPopup()
+            val screenHeight = desktopWindowLayer?.height?.takeIf { it > 0 } ?: (display?.height ?: resources.displayMetrics.heightPixels)
+            val margin = dp(12)
+            val left = loc[0].coerceIn(margin, (screenWidth - popupWidth - margin).coerceAtLeast(margin))
+            val belowTop = (loc[1] + anchor.height + dp(6)).coerceIn(margin, (screenHeight - popupHeight - margin).coerceAtLeast(margin))
+            val fitsBelow = belowTop + popupHeight <= screenHeight - margin
+            val top = if (fitsBelow) {
+                belowTop
+            } else {
+                (loc[1] - popupHeight - dp(6)).coerceAtLeast(margin)
+            }
+            Log.d("DesktopContextMenu", "SHOW pkg=$pkg anchor=${anchor.javaClass.simpleName} x=${loc[0]} y=${loc[1]} displayId=$desktopDisplayId popup=${popupWidth}x$popupHeight screen=${screenWidth}x$screenHeight top=$top fitsBelow=$fitsBelow")
+            runCatching {
+                popup.showAtLocation(window.decorView, Gravity.TOP or Gravity.START, left, top)
+                Log.d("DesktopContextMenu", "SHOWN pkg=$pkg left=$left top=$top overlayType=${WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY}")
+            }.onFailure {
+                Log.e("DesktopContextMenu", "SHOW_FAILED pkg=$pkg", it)
+            }
+        }
+    }
+
+    private fun targetDisplayWidthForPopup(): Int =
+        display?.width?.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+
+    private fun addContextSeparator(parent: LinearLayout) {
+        val v = View(this).apply {
+            setBackgroundColor(0x333A4350)
+        }
+        parent.addView(v, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1).apply {
+            setMargins(dp(8), dp(5), dp(8), dp(5))
+        })
+    }
+
+    private fun addContextAction(
+        parent: LinearLayout,
+        text: String,
+        icon: Any?,
+        action: () -> Unit,
+    ) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            background = rounded(0x281F2630.toInt(), 12f)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setOnClickListener { action() }
+        }
+        val iv = ImageView(this).apply {
+            when (icon) {
+                is Drawable -> setImageDrawable(icon)
+                is Int -> setImageResource(icon)
+            }
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+        }
+        row.addView(iv, LinearLayout.LayoutParams(dp(34), dp(34)))
+        val label = TextView(this).apply {
+            this.text = text
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            gravity = Gravity.CENTER_VERTICAL
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(dp(12), 0, dp(6), 0)
+        }
+        row.addView(label, LinearLayout.LayoutParams(0, dp(46), 1f))
+        parent.addView(row, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(50)
+        ).apply {
+            setMargins(0, dp(2), 0, dp(2))
+        })
+    }
+
+    private fun queryPublishedShortcuts(pkg: String): List<ShortcutInfo> {
+        val launcherApps = getSystemService(LauncherApps::class.java) ?: return emptyList()
+        val query = ShortcutQuery()
+            .setPackage(pkg)
+            .setQueryFlags(
+                ShortcutQuery.FLAG_MATCH_DYNAMIC or
+                    ShortcutQuery.FLAG_MATCH_MANIFEST or
+                    ShortcutQuery.FLAG_MATCH_PINNED
+            )
+        return runCatching {
+            launcherApps.getShortcuts(query, android.os.Process.myUserHandle()).orEmpty()
+                .filter { it.isEnabled }
+                .sortedBy { it.rank }
+        }.getOrElse {
+            Log.w("DesktopShell", "Unable to query shortcuts for $pkg", it)
+            emptyList()
+        }
+    }
+
+    private fun launchPublishedShortcut(info: ShortcutInfo) {
+        val launcherApps = getSystemService(LauncherApps::class.java) ?: return
+        val options = makeVirtualDisplayLaunchOptions(freeform = false, anchor = null)
+        runCatching {
+            launcherApps.startShortcut(info, null, options.toBundle())
+            lifecycleScope.launch(Dispatchers.IO) {
+                RecentAppHelper.addRecentApp(this@DesktopShellActivity, info.`package`)
+            }
+        }.onFailure {
+            Log.e("DesktopShell", "Failed to launch deep shortcut ${info.id}", it)
+            Toast.makeText(this, "快捷方式启动失败：${it.message ?: "未知错误"}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun makeVirtualDisplayLaunchOptions(freeform: Boolean, anchor: View?): ActivityOptions =
+        ActivityOptions.makeBasic().apply {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                setLaunchDisplayId(desktopDisplayId)
+            }
+        }
+
+    private fun launchRemoteAppFreeform(packageName: String) {
+        if (!ensureOverlayPermissionSilently()) {
+            Toast.makeText(this, "需要悬浮窗权限才能显示桌面窗口装饰", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // Do NOT launch the app onto the parent desktop display.
+        // The window owns its own VirtualDisplay+scrcpy session and renders that
+        // session into a TextureView that is hosted by this desktop display's
+        // application-overlay window. This is the app-side equivalent of LMO's
+        // Surface-backed virtual display, without calling the SYSTEM_UID-only LMO service.
+        lifecycleScope.launch(Dispatchers.Main.immediate) {
+            val window = FreeformOverlayDecoration(this@DesktopShellActivity, packageName)
+            desktopWindows.add(window)
+            window.show()
+            lifecycleScope.launch(Dispatchers.IO) {
+                RecentAppHelper.addRecentApp(this@DesktopShellActivity, packageName)
+            }
+            refreshTaskbar(allowWhenUnfocused = true)
+        }
+    }
+
+    internal fun killDesktopWindowTask(taskId: Int) {
+        if (taskId <= 0) return
+        lifecycleScope.launch(Dispatchers.IO) {
+            VirtualDisplayTaskManager.removeTask(taskId)
+        }
+    }
+
+    private fun closeAppTask(packageName: String) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching {
+                runShizuku("am force-stop $packageName")
+            }.onFailure {
+                Log.e("DesktopShell", "关闭应用失败", it)
+            }
+        }
+    }
+
+    private fun showAppInfo(packageName: String) {
+        val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.parse("package:$packageName")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
+    }
+
+    private fun appLabel(pkg: String): String = runCatching {
+        packageManager.getApplicationInfo(pkg, 0).loadLabel(packageManager).toString()
+    }.getOrDefault(pkg)
+
     private fun loadAppIcon(pkg: String): android.graphics.drawable.Drawable {
         return runCatching { packageManager.getApplicationIcon(pkg) }.getOrElse {
             getDrawable(android.R.drawable.sym_def_app_icon)!!
         }
     }
 
-    private fun showDecoration(packageName: String) {
-								if (!ensureOverlayPermissionSilently()) {
-            Toast.makeText(this, "缺少悬浮窗权限且 Shizuku 未就绪，无法显示窗口控制条", Toast.LENGTH_SHORT).show()
-            return
-        }
-        currentTargetPackage = packageName
-        decoration?.remove()
-        decoration = FreeformOverlayDecoration(this, desktopDisplayId, packageName).also { it.show() }
-    }
-
-    private fun startDecorationMonitor() {
-        decorationJob?.cancel()
-        decorationJob = lifecycleScope.launch {
-            while (isActive && !isFinishing && !isDestroyed) {
-                val tasks = findFreeformTasks()
-                val target = tasks.firstOrNull { it.packageName == currentTargetPackage }
-                    ?: tasks.firstOrNull { it.packageName != packageName }
-                if (target != null && Settings.canDrawOverlays(this@DesktopShellActivity)) {
-                    if (decoration == null || currentTargetPackage != target.packageName) {
-                        currentTargetPackage = target.packageName
-                        decoration?.remove()
-                        decoration = FreeformOverlayDecoration(this@DesktopShellActivity, desktopDisplayId, target.packageName).also { it.show() }
-                    }
-                    decoration?.update(target.taskId, target.bounds)
-                } else if (target == null) {
-                    decoration?.hide()
-                }
-                delay(250)
-            }
-        }
-    }
-
-				private fun ensureOverlayPermissionSilently(): Boolean {
-        // 如果已经有权限，直接返回 true
-        if (Settings.canDrawOverlays(this)) {
-            return true
-        }
-
-        // 如果没有权限但 Shizuku 可用，尝试通过 appops 自动提权
-        if (Shizuku.pingBinder()) {
-            runCatching {
-                runShizuku("appops set $packageName SYSTEM_ALERT_WINDOW allow")
-            }.onFailure {
-                Log.e("DesktopShell", "Shizuku 自动赋予悬浮窗权限失败", it)
-            }
-
-            // 再次检查权限是否赋予成功
-            return Settings.canDrawOverlays(this)
-        }
-
-        return false
-    }
-
-    internal fun findTargetTask(packageName: String): TaskInfo? =
-        findFreeformTasks().firstOrNull { it.packageName == packageName }?.let { TaskInfo(it.taskId, it.bounds, it.packageName) }
-
-    private fun findFreeformTasks(): List<TaskInfo> {
-        if (!Shizuku.pingBinder()) return emptyList()
-        return runCatching {
-            val out = runShizuku("dumpsys activity containers")
-            val result = mutableListOf<TaskInfo>()
-            var inDisplay = false
-            var currentId: Int? = null
-            var currentBounds: Rect? = null
-            var currentPackage: String? = null
-            fun flush() {
-                val id = currentId
-                val b = currentBounds
-                val pkg = currentPackage
-                if (inDisplay && id != null && b != null && !pkg.isNullOrBlank()) {
-                    result += TaskInfo(id, b, pkg)
-                }
-                currentId = null
-                currentBounds = null
-                currentPackage = null
-            }
-            val taskPattern = Pattern.compile("Task\\{[0-9a-fA-F]+\\s+#(\\d+).*mode=freeform")
-            val boundsPattern = Pattern.compile("bounds=\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]")
-            for (line in out.lineSequence()) {
-                val display = Regex("^\\s*\\u2514?\\s*Display (\\d+)").find(line)
-                if (display != null) {
-                    flush()
-                    inDisplay = display.groupValues[1].toIntOrNull() == desktopDisplayId
-                    continue
-                }
-                if (!inDisplay) continue
-                val task = taskPattern.matcher(line)
-                if (task.find()) {
-                    flush()
-                    currentId = task.group(1).toIntOrNull()
-                    continue
-                }
-                if (currentId != null) {
-                    val bounds = boundsPattern.matcher(line)
-                    if (bounds.find()) {
-                        currentBounds = Rect(
-                            bounds.group(1).toInt(), bounds.group(2).toInt(),
-                            bounds.group(3).toInt(), bounds.group(4).toInt()
-                        )
-                    }
-                    val pkg = Regex("(?:A=\\d+:|ActivityRecord\\{[^ ]+ u\\d+ )([^/ }]+)").find(line)
-                    if (pkg != null) currentPackage = pkg.groupValues[1]
-                    if (currentPackage == null) {
-                        val slash = Regex("([a-zA-Z0-9_]+\\.[a-zA-Z0-9_.]+)/").find(line)
-                        if (slash != null) currentPackage = slash.groupValues[1]
-                    }
-                }
-            }
-            flush()
-            result
-        }.getOrDefault(emptyList())
-    }
-
+    /** Execute a privileged shell command through Shizuku. */
     internal fun runShizuku(command: String): String {
         val method: Method = Shizuku::class.java.getDeclaredMethod(
             "newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java
         )
         method.isAccessible = true
-        val process = method.invoke(null, arrayOf("sh", "-c", command), null, null) as Process
+        val process = method.invoke(
+            null, arrayOf("sh", "-c", command), null, null
+        ) as java.lang.Process
         val out = BufferedReader(InputStreamReader(process.inputStream)).use { it.readText() }
         process.waitFor()
         return out
     }
 
-    data class TaskInfo(val taskId: Int, val bounds: Rect, val packageName: String)
-
-    override fun onDestroy() {
-        taskbarMonitorJob?.cancel()
-        decorationJob?.cancel()
-        hideDockOverlay()
-        instances.remove(desktopDisplayId)?.let { ref ->
-            if (ref.get() === this) instances.remove(desktopDisplayId)
+    private fun ensureOverlayPermissionSilently(): Boolean {
+        if (Settings.canDrawOverlays(this)) return true
+        if (!Shizuku.pingBinder()) return false
+        runCatching {
+            runShizuku("appops set $packageName SYSTEM_ALERT_WINDOW allow")
+        }.onFailure {
+            Log.w("DesktopShell", "Unable to grant overlay permission via Shizuku", it)
         }
-        super.onDestroy()
+        return Settings.canDrawOverlays(this)
     }
 
-    /**
-     * Show the existing desktop taskbar over the foreground app on THIS
-     * virtual display. The view itself is not duplicated or rebuilt.
-     */
+    /** Move the existing taskbar into a display-local overlay without rebuilding it. */
     private fun showDockOverlay() {
         val dock = desktopTaskbar ?: return
         if (dockOverlayAttached) {
@@ -754,26 +1172,15 @@ class DesktopShellActivity : ComponentActivity() {
             lifecycleScope.launch { refreshTaskbar(allowWhenUnfocused = true) }
             return
         }
-
-								if (!ensureOverlayPermissionSilently()) {
-            Toast.makeText(this, "需要悬浮窗权限，请确保 Shizuku 已激活", Toast.LENGTH_SHORT).show()
-            return
-        }
+        if (!ensureOverlayPermissionSilently()) return
 
         val parent = dock.parent as? ViewGroup
-        parent?.removeView(dock)
-
-        // DesktopShellActivity itself is hosted by the target virtual display.
-        // Still derive the WindowManager from that exact Display so the overlay
-        // cannot accidentally land on the physical/default display.
         val targetDisplay = display ?: return
         val displayContext = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             createDisplayContext(targetDisplay).createWindowContext(
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null
             )
-        } else {
-            createDisplayContext(targetDisplay)
-        }
+        } else createDisplayContext(targetDisplay)
         val wm = displayContext.getSystemService(WindowManager::class.java) ?: return
         val params = WindowManager.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -781,24 +1188,19 @@ class DesktopShellActivity : ComponentActivity() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-																WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
-            PixelFormat.TRANSLUCENT,
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            x = 0
-            y = 0
             title = "VirtualDisplayDesktopDock-$desktopDisplayId"
         }
-
-								dock.setOnTouchListener { _, event ->
-            if (event.action == MotionEvent.ACTION_OUTSIDE) {
+        parent?.removeView(dock)
+        dock.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_OUTSIDE) {
                 hideDockOverlay()
                 true
-            } else {
-                false
-            }
+            } else false
         }
-
         runCatching {
             wm.addView(dock, params)
             dockOverlayWindowManager = wm
@@ -806,19 +1208,18 @@ class DesktopShellActivity : ComponentActivity() {
             dock.visibility = View.VISIBLE
             lifecycleScope.launch { refreshTaskbar(allowWhenUnfocused = true) }
         }.onFailure {
-            // Restore the exact same Dock view to the desktop root if the
-            // display-local overlay cannot be attached.
+            dock.setOnTouchListener(null)
             parent?.addView(dock, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(68)
             ))
-            Log.w("DesktopShellActivity", "Failed to show virtual-display Dock overlay", it)
+            Log.w("DesktopShell", "Failed to show virtual-display Dock overlay", it)
         }
     }
 
     private fun hideDockOverlay() {
         val dock = desktopTaskbar ?: return
         if (!dockOverlayAttached) return
-								dock.setOnTouchListener(null)
+        dock.setOnTouchListener(null)
         runCatching { dockOverlayWindowManager?.removeViewImmediate(dock) }
         dockOverlayWindowManager = null
         dockOverlayAttached = false
@@ -878,6 +1279,12 @@ class DesktopShellActivity : ComponentActivity() {
         override fun getIntrinsicHeight(): Int = bitmap.height
     }
 
+    internal val displayInteractorPublic: DisplayInteractor get() = displayInteractor
+    internal fun dpPublic(value: Int): Int = dp(value)
+    internal fun roundedPublic(color: Int, radiusDp: Float): android.graphics.drawable.Drawable = rounded(color, radiusDp)
+    internal fun ensureOverlayPermissionSilentlyPublic(): Boolean = ensureOverlayPermissionSilently()
+    internal fun logDesktopWindow(message: String, t: Throwable? = null) { Log.w("DesktopShell", message, t) }
+
     private fun rounded(color: Int, radiusDp: Float): android.graphics.drawable.Drawable =
         android.graphics.drawable.GradientDrawable().apply {
             shape = android.graphics.drawable.GradientDrawable.RECTANGLE
@@ -894,114 +1301,10 @@ class DesktopShellActivity : ComponentActivity() {
     private fun Int.roundToInt(): Int = this
     private fun Float.roundToInt(): Int = kotlin.math.round(this).toInt()
 
-private class FreeformOverlayDecoration(
-    private val activity: DesktopShellActivity,
-    private val displayId: Int,
-    private val packageName: String,
-) {
-    private val displayContext = activity.createDisplayContext(activity.display ?: throw IllegalStateException("Desktop display unavailable"))
-    private val wm = displayContext.getSystemService(WindowManager::class.java)
-    private val bar = LinearLayout(displayContext).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        setPadding(8, 0, 4, 0)
-        setBackgroundColor(Color.argb(245, 25, 29, 35))
-        elevation = 12f
-    }
-    private var attached = false
-    private val lp = WindowManager.LayoutParams(
-        320, 46,
-        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-        PixelFormat.TRANSLUCENT
-    ).apply {
-        gravity = Gravity.TOP or Gravity.START
-        title = "VirtualDesktop-FreeformDecoration:$packageName"
-    }
 
-    init {
-        val title = TextView(displayContext).apply {
-            text = packageName.substringAfterLast('.')
-            setTextColor(Color.WHITE)
-            textSize = 12f
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(10, 0, 14, 0)
-        }
-        bar.addView(title, LinearLayout.LayoutParams(0, 46, 1f))
-        bar.addView(button("−") { resize(-1) }, LinearLayout.LayoutParams(46, 46))
-        bar.addView(button("□") { resize(0) }, LinearLayout.LayoutParams(46, 46))
-        bar.addView(button("＋") { resize(1) }, LinearLayout.LayoutParams(46, 46))
-        bar.addView(button("×") { close() }, LinearLayout.LayoutParams(46, 46))
+    internal fun removeDesktopWindowPublic(window: FreeformOverlayDecoration) {
+        desktopWindows.remove(window)
+        lifecycleScope.launch { refreshTaskbar(allowWhenUnfocused = true) }
     }
-
-    fun show() {
-        if (attached) return
-        runCatching {
-            wm.addView(bar, lp)
-            attached = true
-        }.onFailure {
-            android.util.Log.e("FreeformDecoration", "add overlay failed", it)
-        }
-    }
-
-    fun hide() {
-        if (attached) bar.visibility = View.GONE
-    }
-
-    fun update(taskId: Int, bounds: Rect) {
-        if (!attached) show()
-        if (!attached) return
-        lp.width = bounds.width().coerceAtLeast(320)
-        lp.height = 46
-        lp.x = bounds.left
-        lp.y = bounds.top
-        bar.visibility = View.VISIBLE
-        runCatching { wm.updateViewLayout(bar, lp) }
-    }
-
-    fun remove() {
-        if (!attached) return
-        runCatching { wm.removeViewImmediate(bar) }
-        attached = false
-    }
-
-    private fun resize(delta: Int) {
-        val info = activity.findTargetTask(packageName) ?: return
-        val base = info.bounds
-        val target = when (delta) {
-            -1 -> Rect(base.left, base.top, base.left + (base.width() * 0.82f).toInt(), base.top + (base.height() * 0.82f).toInt())
-            1 -> {
-                val w = (base.width() * 1.18f).toInt().coerceAtMost(1800)
-                val h = (base.height() * 1.18f).toInt().coerceAtMost(1000)
-                Rect(base.left, base.top, (base.left + w).coerceAtMost(1910), (base.top + h).coerceAtMost(1070))
-            }
-            else -> Rect(120, 90, 1400, 890)
-        }
-        activity.lifecycleScope.launch {
-            activity.runShizuku("am task resize ${info.taskId} ${target.left} ${target.top} ${target.right} ${target.bottom}")
-        }
-    }
-
-    private fun close() {
-        val info = activity.findTargetTask(packageName)
-        if (info != null) {
-            activity.lifecycleScope.launch {
-                activity.runShizuku("am task remove ${info.taskId}")
-            }
-        }
-        hide()
-    }
-
-    private fun button(text: String, action: () -> Unit): TextView = TextView(displayContext).apply {
-        this.text = text
-        textSize = 18f
-        setTextColor(Color.WHITE)
-        gravity = Gravity.CENTER
-        isClickable = true
-        setOnClickListener { action() }
-    }
-}
 
 }

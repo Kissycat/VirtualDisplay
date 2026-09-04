@@ -124,6 +124,12 @@ class MultiConnectionRepository(
     override suspend fun setDisplaySurface(displayId: Int, surface: Surface?): Result<Unit> =
         activeSlot?.setDisplaySurface(displayId, surface) ?: Result.failure(noActiveSlotError())
 
+    override suspend fun startDisplayVideo(displayId: Int, surface: Surface, width: Int, height: Int): Result<Unit> =
+        activeSlot?.startDisplayVideo(displayId, surface, width, height) ?: Result.failure(noActiveSlotError())
+
+    override suspend fun stopDisplayVideo(displayId: Int): Result<Unit> =
+        activeSlot?.stopDisplayVideo(displayId) ?: Result.failure(noActiveSlotError())
+
     override suspend fun setLocalVideoDecodeEnabled(displayId: Int, enabled: Boolean): Result<Unit> =
         activeSlot?.setLocalVideoDecodeEnabled(displayId, enabled) ?: Result.failure(noActiveSlotError())
 

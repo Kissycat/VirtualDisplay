@@ -59,8 +59,14 @@ This path reuses the existing H.264 encoder. The Android side does not add a sec
 
 ## 桌面模式
 
-控制台新增“桌面模式”，会创建一个独立的 `1920×1080 / 240 DPI` 横向虚拟显示器，并把从应用内启动的应用以 Android Freeform 窗口方式启动。
+控制台新增“桌面模式”，桌面本身创建独立的 `1920×1080 / 160 DPI` 横向虚拟显示器。桌面里的每一个“小窗”都再创建一个独立的 VirtualDisplay，并把该 VirtualDisplay 的画面呈现在目标桌面显示器上的 `TYPE_APPLICATION_OVERLAY` + `TextureView` 中；Overlay 只负责窗口外框、标题栏、Pin、缩放边角和底部手势 Pill，应用本身始终运行在自己的 VirtualDisplay 中，不使用 Android Task Freeform/windowing mode，也不调用系统侧 LMOFreeform 服务。
 
-桌面模式进入操控界面后仍保持原有 WebRTC/H.264 输出链路；当 WebRTC 输出状态变为运行时，本机不再继续渲染该虚拟屏幕画面，操控界面自动切换为触摸板：单指移动为鼠标移动，单指点击为左键，单指拖动为左键拖动，双指点击为右键，双指上下移动为滚轮。
+小窗生命周期与 LMOFreeform 一致：先挂载 Overlay，等待 TextureView 的 `SurfaceTexture` 可用，再创建 VirtualDisplay，并通过 `ActivityOptions.setLaunchDisplayId()` 把应用启动到该显示器。移动窗口只修改 Overlay 的 WindowManager.LayoutParams；缩放只同步 Overlay 内容尺寸和 VirtualDisplay 尺寸；Pin/HangUp 只改变 Overlay 的显示形态。每个小窗拥有自己的 displayId，因此同一应用可以同时打开多个独立实例。
 
-Freeform 使用 Android `ActivityOptions` 的隐藏 `setLaunchWindowingMode()` 能力并通过反射调用，因此最终行为仍取决于设备/ROM 是否允许 Freeform 窗口；不支持时会回退为普通窗口启动。
+桌面模式的输入同样以 VirtualDisplay 为目标：TextureView 接收触摸/鼠标事件，转换后通过对应 displayId 的 ROLE_CONTROL 通道注入到该 VirtualDisplay，避免把输入错误地发送到物理主屏或另一个小窗。
+
+桌面模式进入操控界面后仍保持原有 WebRTC/H.264 输出链路；当 WebRTC 输出状态变为运行时，本机可关闭对应画面解码，仅保留触控/指针控制。
+
+### Freeform chrome provenance
+
+The client-side desktop window chrome in `app/src/main/java/com/ynk/virtualdisplay/ui/desktop/FreeformOverlayDecoration.kt` is a port of the LMOFreeform interaction model and visual structure. The original LMOFreeform project is licensed under the GNU General Public License v3 or later; the corresponding license text is included as `LICENSE-LMOFREEFORM-GPL.txt`. Review the combined licensing requirements before redistributing a build containing this code.

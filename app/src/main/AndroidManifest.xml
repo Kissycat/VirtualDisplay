@@ -61,15 +61,6 @@
         </activity>
 
         <activity
-            android:name=".ui.desktop.FreeformChromeActivity"
-            android:exported="true"
-            android:label="Freeform Controls"
-            android:excludeFromRecents="true"
-            android:noHistory="false"
-            android:resizeableActivity="true"
-            android:theme="@style/Theme.MyApplication" />
-
-        <activity
             android:name=".ui.display.DisplayActivity"
             android:exported="false"
             android:label="Display Player"

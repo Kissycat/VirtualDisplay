@@ -32,8 +32,10 @@ class VideoStreamController(
     private val encodedVideoSinks = CopyOnWriteArraySet<EncodedVideoSink>()
     @Volatile private var encodedWidth = 0
     @Volatile private var encodedHeight = 0
+    @Volatile private var running = false
 
     var onVideoConfig: ((codecLabel: String, width: Int, height: Int) -> Unit)? = null
+    var onStreamEnded: ((reason: String) -> Unit)? = null
     var onPerformanceStats: ((String) -> Unit)? = null
 
     /** Add an optional encoded-video consumer. It does not create another decoder. */
@@ -53,6 +55,7 @@ class VideoStreamController(
     }
 
     suspend fun start(displayId: Int, surface: Surface?, w: Int, h: Int): Result<Unit> = mutex.withLock {
+        running = false
         Log.i(TAG, "Starting video stream for display $displayId... (surface=$surface valid=${surface?.isValid} dims=${w}x${h})")
 
         // 1. 先关闭残留 Scrcpy 子通道 (视频 + 控制)：关闭旧 video socket 会使 decoder
@@ -123,11 +126,18 @@ class VideoStreamController(
                 }
                 onVideoConfig?.invoke(codec, width, height)
             }
+            d.onStreamEnded = { reason ->
+                if (running) {
+                    Log.i(TAG, "Video stream ended for display=$displayId reason=$reason")
+                    onStreamEnded?.invoke(reason)
+                }
+            }
             d.ultraLowLatency = com.ynk.virtualdisplay.data.AppSettings.getUltraLowLatencySync()
             encodedVideoSinks.forEach { d.addEncodedVideoSink(it) }
             surface?.let { d.setDisplaySurface(it) }
             d.start()
             decoder = d
+            running = true
         }
         decoderResult.onFailure {
             Log.e(TAG, "Failed to create/start H264StreamDecoder", it)
@@ -159,6 +169,7 @@ class VideoStreamController(
     }
 
     suspend fun stop() = mutex.withLock {
+        running = false
         stopInternal()
     }
 

@@ -10,6 +10,7 @@ import com.ynk.virtualdisplay.data.repository.IDisplayRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import com.ynk.virtualdisplay.ui.desktop.DesktopWindowInputRouter
 import android.os.Handler
 import android.os.Looper
 
@@ -36,6 +37,14 @@ class InputController(
 
     @Volatile
     private var videoHeight: Int = 0
+
+    // Main virtual-display video size. Desktop-window input is handled by the
+    // window overlay itself and must never hijack this controller's target.
+    @Volatile
+    private var mainVideoWidth: Int = 0
+
+    @Volatile
+    private var mainVideoHeight: Int = 0
 
     @Volatile
     private var displayMode: DisplayMode = DisplayMode.FIT_CENTER
@@ -76,6 +85,10 @@ class InputController(
     private var trackpadThreeFingerStartY = 0f
     private var trackpadThreeFingerMoved = false
     private var trackpadThreeFingerClickTriggered = false
+    private var trackpadDoubleTapDragArmed = false
+    private var trackpadLastTapTime = 0L
+    private var trackpadLastTapX = 0f
+    private var trackpadLastTapY = 0f
     private var trackpadMaxPointerCount = 0
     private var pendingTwoFingerClick = false
     private var pendingThreeFingerClick = false
@@ -164,9 +177,15 @@ class InputController(
         trackpadThreeFingerStartY = 0f
         trackpadThreeFingerMoved = false
         trackpadThreeFingerClickTriggered = false
+        trackpadDoubleTapDragArmed = false
+        trackpadLastTapTime = 0L
+        trackpadLastTapX = 0f
+        trackpadLastTapY = 0f
     }
 
     fun updateVideoSize(width: Int, height: Int) {
+        mainVideoWidth = width
+        mainVideoHeight = height
         videoWidth = width
         videoHeight = height
     }
@@ -203,7 +222,12 @@ class InputController(
      * movement = wheel scroll, two-finger tap = right click.
      */
     fun handleTrackpadEvent(view: View, event: MotionEvent): Boolean {
-        if (!trackpadModeEnabled || !hasVideoSize()) return true
+        if (!trackpadModeEnabled) return true
+        if (mainVideoWidth > 0 && mainVideoHeight > 0) {
+            videoWidth = mainVideoWidth
+            videoHeight = mainVideoHeight
+        }
+        if (!hasVideoSize()) return true
         val displayId = displayIdProvider() ?: return false
 
         if (trackpadCursorX <= 0f && trackpadCursorY <= 0f) {
@@ -235,10 +259,21 @@ class InputController(
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                Log.d("DesktopTrackpad", "DOWN view=${view.javaClass.simpleName} display=$displayIdProvider cursor=${trackpadCursorX},${trackpadCursorY} video=${videoWidth}x${videoHeight}")
                 trackpadGestureHandler.removeCallbacks(pendingTwoFingerClickRunnable)
                 pendingTwoFingerClick = false
                 trackpadMaxPointerCount = 1
                 trackpadDownTime = event.eventTime
+                val sinceLastTap = event.eventTime - trackpadLastTapTime
+                val tapDx = event.x - trackpadLastTapX
+                val tapDy = event.y - trackpadLastTapY
+                val tapSlop = trackpadMoveThreshold * 0.75f
+                trackpadDoubleTapDragArmed = trackpadLastTapTime > 0L &&
+                    sinceLastTap <= android.view.ViewConfiguration.getDoubleTapTimeout() &&
+                    kotlin.math.hypot(tapDx.toDouble(), tapDy.toDouble()).toFloat() <= tapSlop
+                if (trackpadDoubleTapDragArmed) {
+                    Log.d("DesktopTrackpad", "DOUBLE_TAP_DRAG_ARMED dt=$sinceLastTap x=${event.x} y=${event.y}")
+                }
                 trackpadLastX = event.x
                 trackpadLastY = event.y
                 trackpadDownX = event.x
@@ -298,6 +333,7 @@ class InputController(
                         // lets a 3rd/4th finger arrive before any click is emitted.
                         trackpadGestureHandler.removeCallbacks(pendingTwoFingerClickRunnable)
                         pendingTwoFingerClick = false
+                        trackpadDoubleTapDragArmed = false
                         trackpadTwoFinger = true
                         trackpadTapCancelled = true
                         trackpadMoved = false
@@ -352,13 +388,13 @@ class InputController(
                             val dx = x - trackpadTwoFingerLastX
                             if (kotlin.math.abs(dx) > 0.5f) {
                                 trackpadMoved = true
-                                injectScrollEvent(trackpadCursorX, trackpadCursorY, dx / 288f, 0f, 0, displayId)
+                                routeTrackpadScrollOrMain(displayId, dx / 288f, 0f)
                             }
                         } else {
                             val dy = y - trackpadTwoFingerLastY
                             if (kotlin.math.abs(dy) > 0.5f) {
                                 trackpadMoved = true
-                                injectScrollEvent(trackpadCursorX, trackpadCursorY, 0f, dy / 288f, 0, displayId)
+                                routeTrackpadScrollOrMain(displayId, 0f, dy / 288f)
                             }
                         }
                         trackpadTwoFingerLastX = x
@@ -383,8 +419,20 @@ class InputController(
                     trackpadMoved = true
                 }
 
+                if (trackpadDoubleTapDragArmed && !trackpadTwoFinger && !trackpadDragging &&
+                    fromDownDistance >= trackpadDragStartThreshold) {
+                    injectPointerEvent(MotionEvent.ACTION_DOWN, POINTER_ID_MOUSE,
+                        trackpadCursorX, trackpadCursorY, videoWidth, videoHeight, 1f,
+                        MotionEvent.BUTTON_PRIMARY, MotionEvent.BUTTON_PRIMARY, displayId,
+                        InputDevice.SOURCE_MOUSE)
+                    trackpadDragging = true
+                    trackpadMoved = true
+                    trackpadTapCancelled = true
+                    Log.d("DesktopTrackpad", "DOUBLE_TAP_DRAG_START cursor=${trackpadCursorX},${trackpadCursorY}")
+                }
+
                 if (!trackpadTwoFinger && !trackpadLongPressStarted &&
-                    !trackpadTapCancelled && elapsed >= trackpadLongPressMs &&
+                    !trackpadDoubleTapDragArmed && !trackpadTapCancelled && elapsed >= trackpadLongPressMs &&
                     fromDownDistance <= trackpadMoveThreshold) {
                     trackpadLongPressStarted = true
                     trackpadLongPressConsumed = true
@@ -447,8 +495,18 @@ class InputController(
                     !trackpadTapCancelled && !trackpadLongPressConsumed && !trackpadMoved &&
                     event.actionMasked == MotionEvent.ACTION_UP) {
                     injectMouseClick(displayId, secondary = false)
+                    trackpadLastTapTime = event.eventTime
+                    trackpadLastTapX = event.x
+                    trackpadLastTapY = event.y
+                } else if (trackpadMaxPointerCount == 1 && event.actionMasked == MotionEvent.ACTION_UP) {
+                    if (!trackpadDragging) {
+                        trackpadLastTapTime = event.eventTime
+                        trackpadLastTapX = event.x
+                        trackpadLastTapY = event.y
+                    }
                 }
 
+                trackpadDoubleTapDragArmed = false
                 trackpadTwoFinger = false
                 trackpadDragging = false
                 trackpadMoved = false
@@ -498,6 +556,7 @@ class InputController(
 
     private fun injectMouseClick(displayId: Int, secondary: Boolean) {
         val button = if (secondary) MotionEvent.BUTTON_SECONDARY else MotionEvent.BUTTON_PRIMARY
+        Log.d("DesktopTrackpad", "CLICK display=$displayId secondary=$secondary cursor=${trackpadCursorX},${trackpadCursorY} video=${videoWidth}x${videoHeight}")
         injectPointerEvent(
             action = MotionEvent.ACTION_DOWN,
             pointerId = POINTER_ID_MOUSE,
@@ -867,6 +926,33 @@ class InputController(
             this.size = 1f
         })
 
+        if (trackpadModeEnabled && source == InputDevice.SOURCE_MOUSE) {
+            scope.launch(Dispatchers.Main.immediate) {
+                val routed = runCatching {
+                    DesktopWindowInputRouter.injectPointer(
+                        displayId = displayId,
+                        action = action,
+                        x = x,
+                        y = y,
+                        actionButton = actionButton,
+                        buttons = buttons,
+                        pointerId = pointerId,
+                        fallbackWidth = videoWidth,
+                        fallbackHeight = videoHeight,
+                        latch = action != MotionEvent.ACTION_HOVER_MOVE,
+                    )
+                }.getOrDefault(false)
+                if (!routed) {
+                    val event = MotionEvent.obtain(
+                        SystemClock.uptimeMillis(), SystemClock.uptimeMillis(), action, 1,
+                        pointerProperties, pointerCoords, 0, buttons, 0f, 0f, 0, 0, source, 0
+                    )
+                    injectEvent(event, displayId)
+                }
+            }
+            return
+        }
+
         val event = MotionEvent.obtain(
             SystemClock.uptimeMillis(),
             SystemClock.uptimeMillis(),
@@ -884,6 +970,25 @@ class InputController(
             0,
         )
         injectEvent(event, displayId)
+    }
+
+    private fun routeTrackpadScrollOrMain(displayId: Int, hScroll: Float, vScroll: Float) {
+        if (!trackpadModeEnabled) {
+            injectScrollEvent(trackpadCursorX, trackpadCursorY, hScroll, vScroll, 0, displayId)
+            return
+        }
+        scope.launch(Dispatchers.Main.immediate) {
+            val routed = runCatching {
+                DesktopWindowInputRouter.injectScroll(
+                    displayId = displayId, x = trackpadCursorX, y = trackpadCursorY,
+                    hScroll = hScroll, vScroll = vScroll, buttons = 0,
+                    fallbackWidth = videoWidth, fallbackHeight = videoHeight
+                )
+            }.getOrDefault(false)
+            if (!routed) {
+                injectScrollEvent(trackpadCursorX, trackpadCursorY, hScroll, vScroll, 0, displayId)
+            }
+        }
     }
 
     private fun injectScrollEvent(

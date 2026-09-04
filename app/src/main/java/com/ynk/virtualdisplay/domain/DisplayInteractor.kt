@@ -153,6 +153,12 @@ class DisplayInteractor(
         return repository.setDisplaySurface(displayId, surface)
     }
 
+    suspend fun startDisplayVideo(displayId: Int, surface: Surface, width: Int, height: Int): Result<Unit> =
+        repository.startDisplayVideo(displayId, surface, width, height)
+
+    suspend fun stopDisplayVideo(displayId: Int): Result<Unit> =
+        repository.stopDisplayVideo(displayId)
+
     /**
      * 调整显示器尺寸。
      */

@@ -166,23 +166,42 @@ object ScrcpyControlEncoder {
         screenWidth: Int,
         screenHeight: Int,
     ) {
-        val action = event.actionMasked
-        val index = event.actionIndex.coerceIn(0, (event.pointerCount - 1).coerceAtLeast(0))
-        val pointerId = if (event.pointerCount > 0) event.getPointerId(index).toLong() else POINTER_ID_MOUSE
-        val x = if (event.pointerCount > 0) event.getX(index).toInt() else 0
-        val y = if (event.pointerCount > 0) event.getY(index).toInt() else 0
-        val pressure = if (event.pointerCount > 0) event.getPressure(index) else 0f
+        encodeMouseEvent(
+            out,
+            event.actionMasked,
+            if (event.pointerCount > 0) event.getPointerId(event.actionIndex.coerceIn(0, event.pointerCount - 1)).toLong() else POINTER_ID_MOUSE,
+            if (event.pointerCount > 0) event.getX(event.actionIndex.coerceIn(0, event.pointerCount - 1)).toInt() else 0,
+            if (event.pointerCount > 0) event.getY(event.actionIndex.coerceIn(0, event.pointerCount - 1)).toInt() else 0,
+            screenWidth,
+            screenHeight,
+            event.actionButton,
+            event.buttonState,
+        )
+    }
+
+    fun encodeMouseEvent(
+        out: DataOutputStream,
+        action: Int,
+        pointerId: Long,
+        x: Int,
+        y: Int,
+        screenWidth: Int,
+        screenHeight: Int,
+        actionButton: Int,
+        buttons: Int,
+    ) {
+        val pressure = if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) 1f else 0f
 
         out.writeByte(TYPE_INJECT_MOUSE_EVENT)
         out.writeByte(action)
         out.writeLong(pointerId)
-        out.writeInt(x)
-        out.writeInt(y)
+        out.writeInt(x.coerceIn(0, screenWidth.coerceAtLeast(1)))
+        out.writeInt(y.coerceIn(0, screenHeight.coerceAtLeast(1)))
         out.writeShort(screenWidth and 0xFFFF)
         out.writeShort(screenHeight and 0xFFFF)
-        out.writeShort(floatToU16FixedPoint(pressure.coerceIn(0f, 1f)).toInt())
-        out.writeInt(event.actionButton)
-        out.writeInt(event.buttonState)
+        out.writeShort(floatToU16FixedPoint(pressure).toInt())
+        out.writeInt(actionButton)
+        out.writeInt(buttons)
     }
 
     /**

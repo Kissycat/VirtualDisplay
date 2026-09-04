@@ -39,6 +39,7 @@ interface DaemonControlApi {
      * @param screenHeight 视频表面高度 (像素，用于位置编码)
      */
     suspend fun injectInput(displayId: Int, event: InputEvent, screenWidth: Int, screenHeight: Int): Result<Boolean>
+    suspend fun injectMouseEvent(displayId: Int, action: Int, pointerId: Long, x: Int, y: Int, screenWidth: Int, screenHeight: Int, actionButton: Int, buttons: Int): Result<Boolean>
     suspend fun exitDaemon(): Result<Unit>
     suspend fun getRotation(displayId: Int): Result<Int>
     suspend fun freezeRotation(displayId: Int, rotation: Int): Result<Unit>
@@ -151,6 +152,35 @@ class DaemonControlApiImpl(
         } else {
             Result.failure(IllegalStateException("Unexpected response type: $resp"))
         }
+    }
+
+    override suspend fun injectMouseEvent(
+        displayId: Int,
+        action: Int,
+        pointerId: Long,
+        x: Int,
+        y: Int,
+        screenWidth: Int,
+        screenHeight: Int,
+        actionButton: Int,
+        buttons: Int,
+    ): Result<Boolean> = withContext(Dispatchers.IO) {
+        val out = transport.controlOutputStream()
+            ?: return@withContext Result.failure(IllegalStateException("ROLE_CONTROL socket not connected (displayId=$displayId)"))
+        val ok = transport.writeControlMessage { stream ->
+            ScrcpyControlEncoder.encodeMouseEvent(
+                stream,
+                action,
+                pointerId,
+                x,
+                y,
+                screenWidth,
+                screenHeight,
+                actionButton,
+                buttons,
+            )
+        }
+        if (ok) Result.success(true) else Result.failure(IOException("Failed to write mouse event to ROLE_CONTROL socket"))
     }
 
     override suspend fun injectInput(displayId: Int, event: InputEvent, screenWidth: Int, screenHeight: Int): Result<Boolean> = withContext(Dispatchers.IO) {

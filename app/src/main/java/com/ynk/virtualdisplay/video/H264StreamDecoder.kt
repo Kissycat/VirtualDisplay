@@ -47,6 +47,8 @@ class H264StreamDecoder(
     private val codecLock = Any()
 
     var onVideoConfig: ((codecLabel: String, width: Int, height: Int) -> Unit)? = null
+    /** Called when the remote video socket reaches EOF/error without an explicit stop(). */
+    var onStreamEnded: ((reason: String) -> Unit)? = null
     var ultraLowLatency: Boolean = false
 
     private val encodedVideoBroadcaster = EncodedVideoFrameBroadcaster()
@@ -218,6 +220,7 @@ class H264StreamDecoder(
 
     private fun runInputLoop() {
         var framesRead = 0
+        var streamEndedNotified = false
         var firstFrameLogged = false
         var lastStatsLogMs = System.currentTimeMillis()
         try {
@@ -320,11 +323,32 @@ class H264StreamDecoder(
                 }
             }
         } catch (e: IOException) {
-            Log.w(TAG, "IO error in input loop, stream likely closed", e)
+            if (running.get()) {
+                Log.w(TAG, "IO error in input loop, stream likely closed", e)
+                if (!streamEndedNotified) {
+                    streamEndedNotified = true
+                    onStreamEnded?.invoke("io:${e.javaClass.simpleName}")
+                }
+            } else {
+                Log.d(TAG, "IO error during explicit decoder stop: ${e.message}")
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Unexpected error in input loop", e)
+            if (running.get()) {
+                Log.e(TAG, "Unexpected error in input loop", e)
+                if (!streamEndedNotified) {
+                    streamEndedNotified = true
+                    onStreamEnded?.invoke("error:${e.javaClass.simpleName}")
+                }
+            }
             ExceptionUtils.rethrowInDebug(e)
         } finally {
+            if (running.get() && !streamEndedNotified) {
+                // EOF can arrive without an explicit client stop when the
+                // privileged task/display is removed. Notify the owning window
+                // so it can tear down its UI/session immediately.
+                streamEndedNotified = true
+                onStreamEnded?.invoke("eof")
+            }
             Log.i(TAG, "Input loop exiting")
         }
     }

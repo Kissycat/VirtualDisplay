@@ -85,6 +85,7 @@ class ConnectionSlot(
     private var currentVideoWidth: Int = DEFAULT_WIDTH
     private var currentVideoHeight: Int = DEFAULT_HEIGHT
     private val webRtcH264OutputManager = WebRtcH264OutputManager(videoController)
+    private val desktopVideoSessions = java.util.concurrent.ConcurrentHashMap<Int, DesktopVideoSession>()
 
     private val reconnectLock = Any()
     @Volatile private var reconnectJob: Job? = null
@@ -256,6 +257,11 @@ class ConnectionSlot(
         runCatching { reconnectJob?.cancel() }
         webRtcH264OutputManager.stop()
         try { videoController.stop() } catch (e: Exception) { Log.w(TAG, "stop video failed", e) }
+        desktopVideoSessions.values.toList().forEach { session ->
+            runCatching { session.stop() }
+                .onFailure { Log.w(TAG, "stop desktop video session failed", it) }
+        }
+        desktopVideoSessions.clear()
         if (killDaemon) {
             try { remoteDataSource.exitDaemon(); kotlinx.coroutines.delay(100) }
             catch (e: Exception) { Log.w(TAG, "exitDaemon failed", e) }
@@ -402,6 +408,29 @@ class ConnectionSlot(
         )
     }
 
+    override suspend fun startDisplayVideo(displayId: Int, surface: Surface, width: Int, height: Int): Result<Unit> {
+        val existing = desktopVideoSessions[displayId]
+        if (existing != null) {
+            existing.controller.setSurface(surface)
+            return Result.success(Unit)
+        }
+
+        val session = DesktopVideoSession(node)
+        val result = session.start(displayId, surface, width, height)
+        if (result.isSuccess) {
+            desktopVideoSessions[displayId] = session
+        } else {
+            runCatching { session.stop() }
+        }
+        return result
+    }
+
+    override suspend fun stopDisplayVideo(displayId: Int): Result<Unit> {
+        val session = desktopVideoSessions.remove(displayId) ?: return Result.success(Unit)
+        return runCatching { session.stop(); Unit }
+            .fold({ Result.success(Unit) }, { Result.failure(it) })
+    }
+
     override suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit> {
         val result = remoteDataSource.resizeDisplay(displayId, width, height, dpi)
         result.onSuccess {
@@ -461,5 +490,45 @@ class ConnectionSlot(
 
     override fun setPerformanceStatsCallback(callback: ((String) -> Unit)?) {
         videoController.onPerformanceStats = callback
+    }
+}
+
+
+private class DesktopVideoSession(
+    private val node: ServerNode,
+) {
+    private val sessionScope = CoroutineScope(Dispatchers.Main + SupervisorJob() +
+        ExceptionUtils.coroutineExceptionHandler("DesktopVideoSession[${node.uniqueKey()}]"))
+    private val transport = DaemonTransport()
+    private val rpc = DaemonRpc(transport)
+    private val controlApi = com.ynk.virtualdisplay.rpc.DaemonControlApiImpl(rpc, transport)
+    val controller = VideoStreamController(transport, controlApi, sessionScope)
+
+    private var connected = false
+
+    suspend fun start(displayId: Int, surface: Surface, width: Int, height: Int): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            if (!connected) {
+                val host = if (node.host == "0.0.0.0") "127.0.0.1" else node.host
+                connected = transport.connect(
+                    host = host,
+                    port = node.port,
+                    timeoutMs = 5000,
+                    secretToken = node.password.takeIf { it.isNotEmpty() }
+                )
+                if (!connected) return@withContext Result.failure(
+                    java.io.IOException("Desktop video transport connection failed")
+                )
+                rpc.startMessageLoop(sessionScope)
+            }
+            controller.start(displayId, surface, width, height)
+        }
+
+    suspend fun stop() {
+        runCatching { controller.stop() }
+        rpc.stopMessageLoop()
+        runCatching { transport.disconnect() }
+        connected = false
+        sessionScope.coroutineContext[Job]?.cancel()
     }
 }

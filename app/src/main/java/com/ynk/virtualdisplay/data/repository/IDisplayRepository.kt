@@ -64,6 +64,9 @@ interface IDisplayRepository {
 
     /** 设置显示器 Surface — 驱动客户端 H264 解码器 */
     suspend fun setDisplaySurface(displayId: Int, surface: Surface?): Result<Unit>
+    /** Independent H.264 stream used by each LMO-style virtual-display window. */
+    suspend fun startDisplayVideo(displayId: Int, surface: Surface, width: Int, height: Int): Result<Unit> = Result.failure(UnsupportedOperationException())
+    suspend fun stopDisplayVideo(displayId: Int): Result<Unit> = Result.success(Unit)
 
     /** Enable/disable local video decoding without reconnecting video/control sockets. */
     suspend fun setLocalVideoDecodeEnabled(displayId: Int, enabled: Boolean): Result<Unit> = Result.success(Unit)
