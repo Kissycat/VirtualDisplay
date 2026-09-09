@@ -110,6 +110,8 @@ class DesktopShellActivity : ComponentActivity() {
     private var drawerLastHoverY = Float.NaN
     private var drawerLastHoverX = Float.NaN
     @Volatile private var desktopWindowFocused = false
+    private var portraitWindowSerial = 0
+    private var landscapeWindowSerial = 0
     private var desktopRoot: View? = null
     private var desktopWindowLayer: FrameLayout? = null
     private var desktopTaskbar: View? = null
@@ -384,7 +386,7 @@ class DesktopShellActivity : ComponentActivity() {
             }.getOrElse { pkg.substringAfterLast('.') }, compact = true) {
                 closeAppDrawer()
                 launchRemoteApp(pkg)
-            }
+            };
             recentRow.addView(item, LinearLayout.LayoutParams(
                 if (showAppIcons()) dp(62) else dp(160), rowHeight - dp(18)
             ).apply { marginEnd = dp(6) })
@@ -903,14 +905,31 @@ class DesktopShellActivity : ComponentActivity() {
             header.addView(title, LinearLayout.LayoutParams(0, dp(42), 1f))
             popupContent.addView(header)
 
-            addContextAction(popupContent, "打开", loadAppIcon(pkg)) {
+            addContextAction(popupContent, "打开", loadAppIcon(pkg), action = {
                 popup.dismiss()
                 launchRemoteApp(pkg)
-            }
-            addContextAction(popupContent, "在自由窗口打开", android.R.drawable.ic_menu_view) {
+            })
+            addContextAction(
+                popupContent,
+                "在自由窗口打开",
+                android.R.drawable.ic_menu_view,
+                action = {
+                    popup.dismiss()
+                    launchRemoteAppFreeform(pkg, portrait = true)
+                },
+                secondaryAction = {
+                    popup.dismiss()
+                    launchRemoteAppFreeform(pkg, portrait = false)
+                }
+            )
+            addContextAction(popupContent, "左侧分屏打开", android.R.drawable.ic_media_previous, action = {
                 popup.dismiss()
-                launchRemoteAppFreeform(pkg)
-            }
+                launchRemoteAppSplit(pkg, left = true)
+            })
+            addContextAction(popupContent, "右侧分屏打开", android.R.drawable.ic_media_next, action = {
+                popup.dismiss()
+                launchRemoteAppSplit(pkg, left = false)
+            })
 
             if (shortcuts.isNotEmpty()) {
                 addContextSeparator(popupContent)
@@ -929,22 +948,22 @@ class DesktopShellActivity : ComponentActivity() {
                         val launcherApps = getSystemService(LauncherApps::class.java)
                         launcherApps?.getShortcutIconDrawable(si, resources.displayMetrics.densityDpi)
                     }.getOrNull()
-                    addContextAction(popupContent, text, icon ?: loadAppIcon(pkg)) {
+                    addContextAction(popupContent, text, icon ?: loadAppIcon(pkg), action = {
                         popup.dismiss()
                         launchPublishedShortcut(si)
-                    }
+                    })
                 }
             }
 
             addContextSeparator(popupContent)
-            addContextAction(popupContent, "关闭应用", android.R.drawable.ic_menu_close_clear_cancel) {
+            addContextAction(popupContent, "关闭应用", android.R.drawable.ic_menu_close_clear_cancel, action = {
                 popup.dismiss()
                 closeAppTask(pkg)
-            }
-            addContextAction(popupContent, "应用信息", android.R.drawable.ic_menu_info_details) {
+            })
+            addContextAction(popupContent, "应用信息", android.R.drawable.ic_menu_info_details, action = {
                 popup.dismiss()
                 showAppInfo(pkg)
-            }
+            })
 
             popup = PopupWindow(
                 popupContent,
@@ -1008,14 +1027,42 @@ class DesktopShellActivity : ComponentActivity() {
         text: String,
         icon: Any?,
         action: () -> Unit,
+        secondaryAction: (() -> Unit)? = null,
     ) {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             isClickable = true
+            isLongClickable = secondaryAction != null
             background = rounded(0x281F2630.toInt(), 12f)
             setPadding(dp(10), dp(6), dp(10), dp(6))
             setOnClickListener { action() }
+            if (secondaryAction != null) {
+                setOnContextClickListener {
+                    secondaryAction()
+                    true
+                }
+                setOnGenericMotionListener { _, event ->
+                    if (event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS &&
+                        (event.actionButton == MotionEvent.BUTTON_SECONDARY ||
+                            (event.buttonState and MotionEvent.BUTTON_SECONDARY) != 0)
+                    ) {
+                        secondaryAction()
+                        true
+                    } else {
+                        false
+                    }
+                }
+                setOnTouchListener { _, event ->
+                    if (event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS &&
+                        event.actionButton == MotionEvent.BUTTON_SECONDARY) {
+                        secondaryAction()
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
         }
         val iv = ImageView(this).apply {
             when (icon) {
@@ -1082,19 +1129,83 @@ class DesktopShellActivity : ComponentActivity() {
             }
         }
 
-    private fun launchRemoteAppFreeform(packageName: String) {
+    private fun launchRemoteAppFreeform(packageName: String, portrait: Boolean) {
         if (!ensureOverlayPermissionSilently()) {
             Toast.makeText(this, "需要悬浮窗权限才能显示桌面窗口装饰", Toast.LENGTH_SHORT).show()
             return
         }
+        val dockHeight = dp(68)
+        val availableOuterHeight = (display?.height ?: resources.displayMetrics.heightPixels) - dockHeight
+        val topChrome = dp(40)
+        val bottomChrome = dp(32)
+        val minWidth = dp(280)
+        val minHeight = dp(220)
+        val screenWidth = display?.width ?: resources.displayMetrics.widthPixels
+        val screenHeight = display?.height ?: resources.displayMetrics.heightPixels
 
-        // Do NOT launch the app onto the parent desktop display.
-        // The window owns its own VirtualDisplay+scrcpy session and renders that
-        // session into a TextureView that is hosted by this desktop display's
-        // application-overlay window. This is the app-side equivalent of LMO's
-        // Surface-backed virtual display, without calling the SYSTEM_UID-only LMO service.
+        val contentWidth: Int
+        val contentHeight: Int
+        val x: Int
+        val y: Int
+        if (portrait) {
+            contentWidth = dp(480).coerceAtMost((screenWidth - dp(24)).coerceAtLeast(minWidth))
+            contentHeight = (availableOuterHeight - topChrome - bottomChrome).coerceAtLeast(minHeight)
+            val maxX = (screenWidth - contentWidth).coerceAtLeast(0)
+            x = if (maxX == 0) 0 else ((portraitWindowSerial++ * dp(48)) % (maxX + 1))
+            y = 0
+        } else {
+            contentWidth = dp(900).coerceAtMost((screenWidth - dp(24)).coerceAtLeast(minWidth))
+            contentHeight = dp(600).coerceAtMost((availableOuterHeight - topChrome - bottomChrome).coerceAtLeast(minHeight))
+            val maxX = (screenWidth - contentWidth).coerceAtLeast(0)
+            val maxY = (availableOuterHeight - (topChrome + contentHeight + bottomChrome)).coerceAtLeast(0)
+            val step = dp(48)
+            x = if (maxX == 0) 0 else ((landscapeWindowSerial * step) % (maxX + 1))
+            y = if (maxY == 0) 0 else ((landscapeWindowSerial++ * step) % (maxY + 1))
+        }
+
         lifecycleScope.launch(Dispatchers.Main.immediate) {
-            val window = FreeformOverlayDecoration(this@DesktopShellActivity, packageName)
+            val window = FreeformOverlayDecoration(
+                this@DesktopShellActivity,
+                packageName,
+                initialX = x,
+                initialY = y,
+                initialContentWidth = contentWidth,
+                initialContentHeight = contentHeight,
+                portraitMode = portrait,
+            )
+            desktopWindows.add(window)
+            window.show()
+            lifecycleScope.launch(Dispatchers.IO) {
+                RecentAppHelper.addRecentApp(this@DesktopShellActivity, packageName)
+            }
+            refreshTaskbar(allowWhenUnfocused = true)
+        }
+    }
+
+    private fun launchRemoteAppSplit(packageName: String, left: Boolean) {
+        if (!ensureOverlayPermissionSilently()) {
+            Toast.makeText(this, "需要悬浮窗权限才能显示桌面窗口装饰", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val dockHeight = dp(68)
+        val topChrome = dp(40)
+        val bottomChrome = dp(32)
+        val screenWidth = display?.width ?: resources.displayMetrics.widthPixels
+        val screenHeight = display?.height ?: resources.displayMetrics.heightPixels
+        val halfWidth = (screenWidth / 2).coerceAtLeast(dp(280))
+        val availableOuterHeight = (screenHeight - dockHeight).coerceAtLeast(topChrome + bottomChrome + dp(220))
+        val contentHeight = (availableOuterHeight - topChrome - bottomChrome).coerceAtLeast(dp(220))
+        lifecycleScope.launch(Dispatchers.Main.immediate) {
+            val window = FreeformOverlayDecoration(
+                this@DesktopShellActivity,
+                packageName,
+                initialX = if (left) 0 else (screenWidth - halfWidth).coerceAtLeast(0),
+                initialY = 0,
+                initialContentWidth = halfWidth,
+                initialContentHeight = contentHeight,
+                portraitMode = true,
+                splitMode = true,
+            )
             desktopWindows.add(window)
             window.show()
             lifecycleScope.launch(Dispatchers.IO) {

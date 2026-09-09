@@ -39,6 +39,12 @@ import android.util.Log
 internal class FreeformOverlayDecoration(
     private val activity: DesktopShellActivity,
     val packageName: String,
+    private val initialX: Int = activity.dpPublic(120),
+    private val initialY: Int = activity.dpPublic(80),
+    private val initialContentWidth: Int = activity.dpPublic(900),
+    private val initialContentHeight: Int = activity.dpPublic(600),
+    private val portraitMode: Boolean = false,
+    private val splitMode: Boolean = false,
 ) {
     companion object {
         private const val INPUT_TAG = "DesktopWindowInput"
@@ -159,13 +165,13 @@ internal class FreeformOverlayDecoration(
     }
     private var resizeJob: Job? = null
 
-    private var contentWidth = activity.dpPublic(DEFAULT_W_DP)
-    private var contentHeight = activity.dpPublic(DEFAULT_H_DP)
+    private var contentWidth = initialContentWidth
+    private var contentHeight = initialContentHeight
     private var lastWidth = contentWidth
     private var lastHeight = contentHeight
 
-    private var windowX = activity.dpPublic(120)
-    private var windowY = activity.dpPublic(80)
+    private var windowX = initialX
+    private var windowY = initialY
 
     private var dragStartRawX = 0f
     private var dragStartRawY = 0f
