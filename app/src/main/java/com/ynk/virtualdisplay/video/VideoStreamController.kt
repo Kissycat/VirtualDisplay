@@ -3,6 +3,8 @@ package com.ynk.virtualdisplay.video
 import android.util.Log
 import android.view.Surface
 import com.ynk.virtualdisplay.net.DaemonTransport
+import com.ynk.virtualdisplay.data.local.AppSettingsDataSource
+import com.ynk.virtualdisplay.data.AppSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
@@ -16,7 +18,8 @@ import java.io.IOException
 class VideoStreamController(
     private val transport: DaemonTransport,
     private val controlApi: com.ynk.virtualdisplay.rpc.DaemonControlApi,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val settingsDataSource: AppSettingsDataSource? = null
 ) {
     companion object {
         private const val TAG = "VideoStreamController"
@@ -132,7 +135,8 @@ class VideoStreamController(
                     onStreamEnded?.invoke(reason)
                 }
             }
-            d.ultraLowLatency = com.ynk.virtualdisplay.data.AppSettings.getUltraLowLatencySync()
+            d.ultraLowLatency = settingsDataSource?.getUltraLowLatencySync()
+                ?: AppSettings.getUltraLowLatencySync()
             encodedVideoSinks.forEach { d.addEncodedVideoSink(it) }
             surface?.let { d.setDisplaySurface(it) }
             d.start()

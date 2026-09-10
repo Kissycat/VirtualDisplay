@@ -81,7 +81,7 @@ interface IDisplayRepository {
     suspend fun launchHome(displayId: Int): Result<Int>
 
     /** 列出远程设备上已安装应用（用于 AppSelectionDialog） */
-    suspend fun listApps(): Result<List<DeviceMessage.AppEntry>>
+    suspend fun listApps(forceRefresh: Boolean = false): Result<List<DeviceMessage.AppEntry>>
 
     /** 注入输入事件 */
     suspend fun injectInput(event: InputEvent): Result<Boolean>

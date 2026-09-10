@@ -39,7 +39,7 @@ import org.koin.dsl.module
  */
 val appModule = module {
     // === 核心基础设施层 ===
-    single { DaemonProcessController(androidContext()) }
+    single { DaemonProcessController(androidContext(), get()) }
     single { GatewayProcessController(androidContext()) }
     single { DaemonTransport() }
     single { DaemonRpc(get()) }
@@ -48,20 +48,20 @@ val appModule = module {
     // VideoStreamRpc：视频流 RPC（供 VideoStreamController 使用）
     single { DaemonControlApiImpl(get(), get()) }
     single<DaemonControlApi> { get<DaemonControlApiImpl>() }
+    single { AppSettingsDataSource(androidContext()) }
     // VideoStreamController 使用的协程 Scope：主线程调度器 + SupervisorJob + 异常处理器
     // 注意：这是跨组件共享的单例 Scope，任何地方都不得对其调用 cancel()，
     // 否则会不可逆地破坏 VideoStreamController 等所有使用者。
     single { CoroutineScope(Dispatchers.Main + SupervisorJob() + ExceptionUtils.coroutineExceptionHandler("VideoStreamController")) }
 
-    single { VideoStreamController(get(), get(), get()) }
+    single { VideoStreamController(get(), get(), get(), get()) }
 
     // === Data 层 DataSource ===
     // Local：  AppSettings / DaemonPrefs 本地配置读写
     // Remote： Daemon 控制命令 RPC 调用（launchHome / listApps / startActivity 等统一走 RPC）
     // Process：Daemon 进程生命周期控制（本机节点独有）
-    single { AppSettingsDataSource(androidContext()) }
     single { DaemonRemoteDataSource(get()) }
-    single { DaemonProcessDataSource(get()) }
+    single { DaemonProcessDataSource(get(), get(), get()) }
 
     // === Multi-Connection Infrastructure ===
     single {

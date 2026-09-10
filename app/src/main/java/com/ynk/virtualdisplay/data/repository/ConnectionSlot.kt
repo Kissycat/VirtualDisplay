@@ -24,6 +24,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -85,6 +86,7 @@ class ConnectionSlot(
     private var currentVideoWidth: Int = DEFAULT_WIDTH
     private var currentVideoHeight: Int = DEFAULT_HEIGHT
     private val webRtcH264OutputManager = WebRtcH264OutputManager(videoController)
+    private val appsCache = AtomicReference<List<DeviceMessage.AppEntry>?>(null)
     private val desktopVideoSessions = java.util.concurrent.ConcurrentHashMap<Int, DesktopVideoSession>()
 
     private val reconnectLock = Any()
@@ -199,12 +201,6 @@ class ConnectionSlot(
                     if (privilegeMode == PrivilegeMode.SHIZUKU && !shizukuManager.isAvailable()) {
                         _connectionError.value = "Shizuku is not available"
                         _connectionStatus.value = ConnectionStatus.ERROR
-                        return@launch
-                    }
-                    val autoStart = AppSettings.getAutoStartServerSync()
-                    val isRunning = withContext(Dispatchers.IO) { processDataSource.getDaemonPid() > 0 }
-                    if (!autoStart && !isRunning) {
-                        _connectionStatus.value = ConnectionStatus.DISCONNECTED
                         return@launch
                     }
                     val started = withContext(Dispatchers.IO) {
@@ -451,8 +447,14 @@ class ConnectionSlot(
     override suspend fun launchHome(displayId: Int): Result<Int> =
         remoteDataSource.launchHome(displayId)
 
-    override suspend fun listApps(): Result<List<DeviceMessage.AppEntry>> =
-        remoteDataSource.listApps()
+    override suspend fun listApps(forceRefresh: Boolean): Result<List<DeviceMessage.AppEntry>> {
+        if (!forceRefresh) {
+            appsCache.get()?.let { return Result.success(it) }
+        }
+        val result = remoteDataSource.listApps(forceRefresh = forceRefresh)
+        result.onSuccess { appsCache.set(it) }
+        return result
+    }
 
     override suspend fun injectInput(event: InputEvent): Result<Boolean> =
         injectInputWithDisplayId(event, 0)

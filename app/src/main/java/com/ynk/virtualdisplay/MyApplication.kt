@@ -14,30 +14,19 @@ import org.koin.core.context.GlobalContext.loadKoinModules
 import org.koin.core.context.startKoin
 
 /**
- * VirtualDisplay 自定义应用入口。
+ * VirtualDisplay 应用入口，采用单阶段冷启动。
  *
- * 采用两阶段启动模式（参考 GAMEHELPER）：
- *
- * 【第一阶段：Application.onCreate - 冷启动立即执行】
- *   1. 初始化全局异常处理器
- *   2. startKoin(coreModule)：加载 ShizukuManager / PermissionManager / DisplayMetricsManager
- *      这些组件不需要 Shizuku 授权或存储权限，仅用于权限检测和显示信息查询
- *
- * 【第二阶段：Shizuku 权限验证通过后 - 由 MainActivity 调用 bootstrapCore】
- *   1. AppSettings.init()：初始化 DataStore
- *   2. loadKoinModules(appModule)：增量加载 DaemonProcessController / Repository /
- *      DisplayInteractor / MainViewModel 等依赖 Shizuku 授权的重型组件
- *
- * 这种设计确保：
- * - 权限页（ShizukuPermissionScreen）冷启动即可工作，不需要等待 Daemon 初始化
- * - Daemon 进程只在 Shizuku 授权后才尝试启动，避免无效的资源消耗
+ * [onCreate] 中一次性完成全局异常处理器、DataStore 初始化，并
+ * 通过 startKoin 加载全部模块（coreModule + appModule），启动后所有
+ * 组件立即可用，无需等待 Shizuku 授权。所有模块就绪后置 [isCoreBootstrapped] 为 true；
+ * [bootstrapCore] 仅为兼容旧调用点而保留的空操作。
  */
 class MyApplication : Application() {
     companion object {
         private const val TAG = "MyApplication"
     }
 
-    /** 核心组件（AppSettings + appModule）是否已完成 bootstrap */
+    /** 核心组件（AppSettings + 全部 Koin 模块）是否已初始化完成；在 onCreate 末尾被置为 true */
     @Volatile
     var isCoreBootstrapped: Boolean = false
         private set
@@ -60,7 +49,10 @@ class MyApplication : Application() {
     }
 
     /**
-     * 兼容性保留，已在冷启动中完成。
+     * 兼容性保留的空操作。
+     *
+     * 冷启动（onCreate）已完成全部初始化，此处无需再做任何加载。
+     * 保留该方法以兼容外部调用点（如 MainActivity），避免破坏既有调用方。
      */
     @Synchronized
     fun bootstrapCore() {

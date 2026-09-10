@@ -70,6 +70,9 @@ internal class DesktopWindowSession(
     // DOWN/MOVE/UP events in rapid succession; launching each write in a fresh IO
     // coroutine can otherwise reorder or interleave frames on the socket.
     private val inputMutex = Mutex()
+    // close button and TASK_EXITED callback can race; serialize teardown so exactly
+    // one path performs RELEASE_VIRTUAL_DISPLAY before the daemon connection closes.
+    private val stopMutex = Mutex()
 
     private var displayId: Int = -1
     private var taskId: Int = -1
@@ -309,25 +312,36 @@ internal class DesktopWindowSession(
         }
     }
 
-    suspend fun stop() = withContext(Dispatchers.IO) {
-        if (!started && displayId < 0) {
-            cleanupConnectionOnly()
+    suspend fun stop() = stopMutex.withLock {
+        withContext(Dispatchers.IO) {
+            if (!started && displayId < 0) {
+                cleanupConnectionOnly()
+                outputSurface?.release()
+                outputSurface = null
+                return@withContext
+            }
+
+            val id = displayId
+            started = false
+            runCatching { video.stop() }.onFailure {
+                Log.w(TAG, "Video stop failed during window teardown display=$id", it)
+            }
+            if (id >= 0) {
+                val releaseResult = runCatching { controlApi.releaseDisplay(id) }.getOrElse {
+                    Result.failure<Unit>(it)
+                }
+                if (releaseResult.isFailure) {
+                    Log.e(TAG, "RELEASE_VIRTUAL_DISPLAY failed display=$id", releaseResult.exceptionOrNull())
+                } else {
+                    Log.i(TAG, "RELEASE_VIRTUAL_DISPLAY succeeded display=$id")
+                }
+            }
+            displayId = -1
+            taskId = -1
             outputSurface?.release()
             outputSurface = null
-            return@withContext
+            cleanupConnectionOnly()
         }
-
-        val id = displayId
-        started = false
-        runCatching { video.stop() }
-        if (id >= 0) {
-            runCatching { controlApi.releaseDisplay(id) }
-        }
-        displayId = -1
-        taskId = -1
-        outputSurface?.release()
-        outputSurface = null
-        cleanupConnectionOnly()
     }
 
     private suspend fun cleanupConnectionOnly() {

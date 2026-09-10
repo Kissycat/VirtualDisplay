@@ -4,7 +4,6 @@ import android.util.Log
 import com.ynk.virtualdisplay.BuildConfig
 import kotlinx.coroutines.CoroutineExceptionHandler
 import java.io.Closeable
-import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -29,6 +28,10 @@ object ExceptionUtils {
 
     private val crashHandlerInstalled = AtomicBoolean(false)
 
+    /**
+     * 安装全局未捕获异常处理器：记录崩溃摘要后透传给系统默认处理器。
+     * 幂等，重复调用只生效一次。
+     */
     fun setupGlobalCrashHandler() {
         if (!crashHandlerInstalled.compareAndSet(false, true)) {
             return
@@ -61,6 +64,11 @@ object ExceptionUtils {
         }
     }
 
+    /**
+     * 构造协程异常处理器，统一记录未被捕获的协程异常。
+     *
+     * @param tag 日志标签，默认使用类默认标签。
+     */
     fun coroutineExceptionHandler(tag: String = TAG): CoroutineExceptionHandler {
         return CoroutineExceptionHandler { _, throwable ->
             Log.e(tag, "Uncaught coroutine exception: ${throwable.message}", throwable)
@@ -78,18 +86,28 @@ object ExceptionUtils {
         if (STRICT) throw throwable
     }
 
+    /**
+     * 安全关闭可关闭资源，关闭失败时记录 warning 日志后吞掉。
+     *
+     * @param tag       日志标签。
+     * @param closeable 待关闭资源，为 null 时静默忽略。
+     */
     fun safeClose(tag: String, closeable: Closeable?) {
         closeable?.let {
             try {
                 it.close()
-            } catch (e: IOException) {
-                Log.w(tag, "Failed to close resource", e)
             } catch (e: Exception) {
                 Log.w(tag, "Failed to close resource", e)
             }
         }
     }
 
+    /**
+     * 静默关闭可关闭资源，关闭失败仅记录 debug 日志，不干扰主流程。
+     *
+     * @param tag       日志标签。
+     * @param closeable 待关闭资源，为 null 时静默忽略。
+     */
     fun safeCloseSilently(tag: String, closeable: Closeable?) {
         closeable?.let {
             try {
@@ -100,6 +118,10 @@ object ExceptionUtils {
         }
     }
 
+    /**
+     * 若异常为协程取消 [CancellationException]，以 debug 级别记录日志。
+     * 用于在 catch 块中区分"主动取消"与真正的错误。
+     */
     fun logIfCancellation(tag: String, throwable: Throwable) {
         if (throwable is kotlinx.coroutines.CancellationException) {
             Log.d(tag, "Coroutine cancelled: ${throwable.message}")
@@ -107,10 +129,12 @@ object ExceptionUtils {
     }
 }
 
+/** 扩展函数：静默关闭 [Closeable]，为 null 时安全忽略。 */
 fun Closeable?.closeQuietly() {
     ExceptionUtils.safeCloseSilently(ExceptionUtils.TAG, this)
 }
 
+/** 扩展函数：静默关闭 [LocalSocket]，关闭失败仅记录 debug 日志。 */
 fun android.net.LocalSocket?.closeQuietly() {
     try {
         this?.close()
@@ -119,10 +143,12 @@ fun android.net.LocalSocket?.closeQuietly() {
     }
 }
 
+/** 扩展函数：静默关闭 [InputStream]，为 null 时安全忽略。 */
 fun java.io.InputStream?.closeQuietly() {
     ExceptionUtils.safeCloseSilently(ExceptionUtils.TAG, this)
 }
 
+/** 扩展函数：静默关闭 [OutputStream]，为 null 时安全忽略。 */
 fun java.io.OutputStream?.closeQuietly() {
     ExceptionUtils.safeCloseSilently(ExceptionUtils.TAG, this)
 }

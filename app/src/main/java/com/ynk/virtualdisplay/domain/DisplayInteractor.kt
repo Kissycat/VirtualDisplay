@@ -183,8 +183,8 @@ class DisplayInteractor(
     /**
      * 查询远程设备上已安装应用列表。
      */
-    suspend fun listApps(): Result<List<DeviceMessage.AppEntry>> {
-        return repository.listApps()
+    suspend fun listApps(forceRefresh: Boolean = false): Result<List<DeviceMessage.AppEntry>> {
+        return repository.listApps(forceRefresh)
     }
 
     /**

@@ -252,14 +252,6 @@ class DaemonDisplayRepository(
                         return Result.failure(IllegalStateException(err))
                     }
 
-                    // 检查自动启动选项
-                    val autoStart = AppSettings.getAutoStartServerSync()
-                    val isRunning = withContext(Dispatchers.IO) { processDataSource.getDaemonPid() > 0 }
-                    if (!autoStart && !isRunning) {
-                        Log.i(TAG, "autoStart is false and daemon not running, skipping startDaemon and connection")
-                        _connectionStatus.value = ConnectionStatus.DISCONNECTED
-                        return Result.success(Unit)
-                    }
 
                     // 启动守护进程 → Process DataSource
                     val started = withContext(Dispatchers.IO) {
@@ -517,8 +509,8 @@ class DaemonDisplayRepository(
     override suspend fun launchHome(displayId: Int): Result<Int> =
         remoteDataSource.launchHome(displayId)
 
-    override suspend fun listApps(): Result<List<DeviceMessage.AppEntry>> =
-        remoteDataSource.listApps()
+    override suspend fun listApps(forceRefresh: Boolean): Result<List<DeviceMessage.AppEntry>> =
+        remoteDataSource.listApps(forceRefresh)
 
     override suspend fun injectInput(event: InputEvent): Result<Boolean> {
         return injectInputWithDisplayId(event, 0)

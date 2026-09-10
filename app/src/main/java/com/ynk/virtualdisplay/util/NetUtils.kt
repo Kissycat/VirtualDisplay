@@ -1,10 +1,27 @@
 package com.ynk.virtualdisplay.util
 
+import android.util.Log
 import java.net.*
 
 object NetUtils {
+    private const val TAG = "NetUtils"
+
     const val LOCAL_HOST = "127.0.0.1"
     const val ANY_HOST = "0.0.0.0"
+    const val IPV6_ANY = "::"
+    const val IPV6_LOOPBACK = "::1"
+
+    private val IPV4_REGEX = Regex("^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$")
+    private val HOSTNAME_REGEX = Regex("^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\\-]*[a-zA-Z0-9])(\\.[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\\-]*[a-zA-Z0-9])*$")
+
+    fun getDefaultLoopback(): String {
+        return try {
+            InetAddress.getLoopbackAddress().hostAddress ?: LOCAL_HOST
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to get system loopback address, using $LOCAL_HOST", e)
+            LOCAL_HOST
+        }
+    }
 
     fun getFriendlyErrorMessage(t: Throwable): String {
         return when (t) {
@@ -23,10 +40,81 @@ object NetUtils {
         }
     }
 
-    /**
-     * 如果为 0.0.0.0 返回本地环路地址，否则返回实际ip
-     */
     fun resolveConnectHost(host: String): String {
-        return if (host == ANY_HOST) LOCAL_HOST else host
+        return when (val trimmed = host.trim()) {
+            ANY_HOST -> LOCAL_HOST
+            IPV6_ANY -> IPV6_LOOPBACK
+            else -> if (trimmed.length > 2 && trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                trimmed.substring(1, trimmed.length - 1)
+            } else {
+                trimmed
+            }
+        }
+    }
+
+    fun isLocalHost(host: String): Boolean {
+        val trimmed = host.trim()
+        val defaultLoopback = getDefaultLoopback()
+        return trimmed == LOCAL_HOST ||
+                trimmed == IPV6_LOOPBACK ||
+                trimmed == "localhost" ||
+                trimmed == ANY_HOST ||
+                trimmed == IPV6_ANY ||
+                trimmed.equals(defaultLoopback, ignoreCase = true)
+    }
+
+    fun isValidHostFormat(host: String): Boolean {
+        val trimmed = host.trim()
+        if (trimmed.isEmpty()) return false
+        // 方括号形式 [2001:db8::1]：剥掉括号后按 IPv6 校验
+        if (trimmed.length > 2 && trimmed.startsWith("[") && trimmed.endsWith("]")) {
+            return isValidHostFormat(trimmed.substring(1, trimmed.length - 1))
+        }
+        if (trimmed == IPV6_ANY || trimmed == IPV6_LOOPBACK) return true
+        if (IPV4_REGEX.matches(trimmed)) return true
+        if (isValidIpv6Format(trimmed)) return true
+        if (HOSTNAME_REGEX.matches(trimmed)) return true
+        return false
+    }
+
+    private fun isValidIpv6Format(ip: String): Boolean {
+        if (!ip.contains(':')) return false
+        if (ip.count { it == ':' } < 2) return false
+        val doubleColonIndex = ip.indexOf("::")
+        if (doubleColonIndex != -1 && ip.indexOf("::", doubleColonIndex + 2) != -1) {
+            return false
+        }
+        val parts = ip.split(":")
+        if (doubleColonIndex == -1 && parts.size != 8) {
+            return false
+        }
+        for ((index, part) in parts.withIndex()) {
+            if (part.isEmpty()) continue
+            // 允许 IPv4 映射形式（如 ::ffff:192.168.1.1）的末段
+            if (index == parts.lastIndex && IPV4_REGEX.matches(part)) continue
+            if (part.length > 4) return false
+            if (part.isNotEmpty() && !part.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }) {
+                return false
+            }
+        }
+        return true
+    }
+
+    fun getAvailableNetworkAddresses(): List<Pair<String, String>> {
+        return listOf(
+            "仅本机 ($LOCAL_HOST)" to LOCAL_HOST,
+            "全部接口 IPv4+IPv6 ($IPV6_ANY)" to IPV6_ANY
+        )
+    }
+
+    fun testConnection(host: String, port: Int, timeoutMs: Int = 3000): Result<Unit> {
+        return try {
+            Socket().use { s ->
+                s.connect(InetSocketAddress(host, port), timeoutMs)
+            }
+            Result.success(Unit)
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
     }
 }

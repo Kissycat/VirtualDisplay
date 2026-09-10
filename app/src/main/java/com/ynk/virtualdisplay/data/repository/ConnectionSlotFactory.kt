@@ -27,6 +27,12 @@ class ConnectionSlotFactory(
     private val processDataSource: DaemonProcessDataSource,
     private val shizukuManager: ShizukuManager,
 ) {
+    /**
+     * 为指定节点创建一套独立的连接资源（transport / rpc / remoteDataSource / videoController）。
+     * 本机节点才持有进程控制权（[ConnectionSlot.processDataSource] 非空）。
+     * @param node 目标服务器节点
+     * @return 组装完毕的 [ConnectionSlot]
+     */
     fun create(node: ServerNode): ConnectionSlot {
         // 每个槽独立的基础设施对象
         val transport = DaemonTransport()
@@ -39,7 +45,7 @@ class ConnectionSlotFactory(
             Dispatchers.Main + SupervisorJob() +
                 ExceptionUtils.coroutineExceptionHandler("VideoStream[${node.uniqueKey()}]")
         )
-        val videoController = VideoStreamController(transport, controlApi, videoScope)
+        val videoController = VideoStreamController(transport, controlApi, videoScope, settingsDataSource)
 
         // 本机节点才持有进程控制权
         val slotProcessDataSource = if (node.isLocal) processDataSource else null

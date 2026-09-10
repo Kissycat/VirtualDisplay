@@ -42,7 +42,7 @@ class DaemonRemoteDataSource(
     suspend fun launchHome(displayId: Int): Result<Int> =
         controlApi.launchHome(displayId)
 
-    suspend fun listApps(): Result<List<com.ynk.virtualdisplay.protocol.DeviceMessage.AppEntry>> =
+    suspend fun listApps(forceRefresh: Boolean = false): Result<List<com.ynk.virtualdisplay.protocol.DeviceMessage.AppEntry>> =
         controlApi.listApps()
 
     // === 输入注入 (scrcpy-native protocol via ROLE_CONTROL socket) ===
