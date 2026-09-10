@@ -859,7 +859,11 @@ class DisplayActivity : ComponentActivity() {
                         val id = remoteDisplayId
                         when {
                             -dy > kotlin.math.abs(dx) * 1.15f -> {
+                                // Returning to the desktop must immediately hide the
+                                // floating dock before HOME is launched, so the dock
+                                // never remains visible over the bare desktop.
                                 if (id != null) {
+                                    DesktopShellActivity.hideDockForDisplay(id)
                                     lifecycleScope.launch {
                                         repository.launchHome(id)
                                             .onFailure { Log.w(TAG, "Four-finger home failed", it) }

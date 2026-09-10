@@ -37,6 +37,7 @@ import android.content.pm.LauncherApps
 import android.content.pm.ShortcutInfo
 import android.content.pm.LauncherApps.ShortcutQuery
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
 import com.ynk.virtualdisplay.domain.DisplayInteractor
@@ -84,8 +85,21 @@ class DesktopShellActivity : ComponentActivity() {
         fun showDockForDisplay(displayId: Int) {
             instances[displayId]?.get()?.let { activity ->
                 activity.runOnUiThread {
+                    if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
+                    if (!activity.hasFullscreenDesktopApp()) {
+                        activity.hideDockOverlay()
+                        return@runOnUiThread
+                    }
+                    activity.showDockOverlay()
+                }
+            }
+        }
+
+        fun hideDockForDisplay(displayId: Int) {
+            instances[displayId]?.get()?.let { activity ->
+                activity.runOnUiThread {
                     if (!activity.isFinishing && !activity.isDestroyed) {
-                        activity.showDockOverlay()
+                        activity.hideDockOverlay()
                     }
                 }
             }
@@ -131,6 +145,11 @@ class DesktopShellActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                Log.d("DesktopShell", "Back ignored on desktop shell; use Exit Desktop from wallpaper menu")
+            }
+        })
         desktopDisplayId = display?.displayId ?: intent.getIntExtra("display_id", Display.DEFAULT_DISPLAY)
         window.decorView.systemUiVisibility = (
             View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
@@ -275,7 +294,8 @@ class DesktopShellActivity : ComponentActivity() {
     internal fun desktopDpiPublic(): Int = desktopPrefs.getInt(PREF_DESKTOP_DPI, 160)
 
     override fun onDestroy() {
-        // Release desktop-window resources before the shell Activity goes away.
+        Log.w("DesktopShell", "onDestroy: shell is actually being destroyed; releasing child windows")
+        // Release desktop-window resources only when the shell Activity is truly destroyed.
         closeAppDrawer()
         taskbarMonitorJob?.cancel()
         taskbarMonitorJob = null
@@ -287,6 +307,12 @@ class DesktopShellActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // A floating dock is only allowed while another full-screen app owns
+        // the Desktop display. When we return to the bare desktop, force it
+        // away even if the previous app left the overlay attached.
+        if (!hasFullscreenDesktopApp()) {
+            hideDockOverlay()
+        }
         // Task discovery is allowed only while the DesktopShell itself is the
         // focused/visible window. This keeps dumpsys/shizuku work completely
         // out of the active full-screen application/video path.
@@ -312,6 +338,9 @@ class DesktopShellActivity : ComponentActivity() {
         super.onWindowFocusChanged(hasFocus)
         desktopWindowFocused = hasFocus
         if (hasFocus && !isFinishing && !isDestroyed) {
+            if (!hasFullscreenDesktopApp()) {
+                hideDockOverlay()
+            }
             taskbarMonitorJob?.cancel()
             taskbarMonitorJob = lifecycleScope.launch {
                 // Query immediately when we really return to the desktop.
@@ -327,9 +356,10 @@ class DesktopShellActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // The virtual display launches this Activity as its HOME task. Reassert
-        // the full desktop content whenever WindowManager re-delivers the HOME
-        // intent after a task switch.
+        // Returning HOME must not destroy the DesktopShell task: existing
+        // floating windows belong to this shell lifecycle and must survive.
+        // Only transient Desktop Dock UI is hidden here.
+        hideDockOverlay()
         window.decorView.post {
             if (window.decorView.width > 0 && window.decorView.height > 0) {
                 window.decorView.requestLayout()
@@ -364,6 +394,8 @@ class DesktopShellActivity : ComponentActivity() {
             background = roundedPublic(0xF0161A20.toInt(), 20f)
             clipChildren = true
             clipToPadding = true
+            isClickable = true
+            isFocusable = false
             setPadding(dp(6), dp(6), dp(6), dp(6))
         }
         val recentRow = LinearLayout(displayContext).apply {
@@ -381,12 +413,17 @@ class DesktopShellActivity : ComponentActivity() {
         ))
 
         fun addRecentItem(pkg: String, index: Int) {
-            val item = createAppItem(pkg, runCatching {
-                packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
-            }.getOrElse { pkg.substringAfterLast('.') }, compact = true) {
-                closeAppDrawer()
-                launchRemoteApp(pkg)
-            };
+            val item = createAppItem(
+                packageName = pkg,
+                label = runCatching {
+                    packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+                }.getOrElse { pkg.substringAfterLast('.') },
+                compact = true,
+                onClick = {
+                    closeAppDrawer()
+                    launchRemoteApp(pkg)
+                }
+            )
             recentRow.addView(item, LinearLayout.LayoutParams(
                 if (showAppIcons()) dp(62) else dp(160), rowHeight - dp(18)
             ).apply { marginEnd = dp(6) })
@@ -425,6 +462,7 @@ class DesktopShellActivity : ComponentActivity() {
         drawerOverlayRoot = container
         drawerOverlayWindowManager = wm
         drawerOverlayParams = params
+        shiftWindowsForDrawer(params.x, fullWidth)
 
         fun expandDrawer() {
             if (drawerExpanded || drawerOverlayRoot == null) return
@@ -490,10 +528,16 @@ class DesktopShellActivity : ComponentActivity() {
         }
 
         runCatching { wm.addView(container, params) }
+            .onSuccess {
+                // Newly added drawer must be the highest interactive overlay.
+                // Keep the full drawer above both the dock and freeform windows.
+                raiseDesktopInteractiveOverlays()
+            }
             .onFailure {
                 drawerOverlayRoot = null
                 drawerOverlayWindowManager = null
                 drawerOverlayParams = null
+                restoreWindowsAfterDrawer()
                 Log.w("DesktopShell", "Failed to show app drawer overlay", it)
             }
 
@@ -576,6 +620,21 @@ class DesktopShellActivity : ComponentActivity() {
         ).apply { topMargin = dp(86) })
     }
 
+    private fun shiftWindowsForDrawer(drawerX: Int, drawerWidth: Int) {
+        val gap = dp(16)
+        val targetX = drawerX + drawerWidth + gap
+        val screenWidth = display?.width ?: resources.displayMetrics.widthPixels
+        desktopWindows.forEachIndexed { index, window ->
+            if (window.isVisible() && !window.isMinimizedForLayout()) {
+                window.moveAsideForDrawer(targetX, screenWidth, index)
+            }
+        }
+    }
+
+    private fun restoreWindowsAfterDrawer() {
+        desktopWindows.forEach { it.restoreAfterDrawer() }
+    }
+
     private fun closeAppDrawer() {
         val root = drawerOverlayRoot ?: return
         runCatching { drawerOverlayWindowManager?.removeViewImmediate(root) }
@@ -583,6 +642,7 @@ class DesktopShellActivity : ComponentActivity() {
         drawerOverlayRoot = null
         drawerOverlayParams = null
         drawerExpanded = false
+        restoreWindowsAfterDrawer()
     }
 
     private fun launchRemoteApp(packageName: String) {
@@ -662,19 +722,39 @@ class DesktopShellActivity : ComponentActivity() {
             val shown = LinkedHashSet<String>()
             taskSnapshot.forEach { task ->
                 if (!shown.add(task.packageName)) return@forEach
+                val window = desktopWindows.firstOrNull { it.packageName == task.packageName }
                 val item = createAppItem(
                     packageName = task.packageName,
                     label = runCatching { packageManager.getApplicationLabel(packageManager.getApplicationInfo(task.packageName, 0)).toString() }
                         .getOrElse { task.packageName.substringAfterLast('.') },
                     compact = true
-                ) { VirtualDisplayTaskManager.focusTask(task.taskId) }
+                ) {
+                    if (window != null) {
+                        window.toggleMinimizedFromDock()
+                    } else {
+                        // A normal full-screen desktop task uses task z-order as its
+                        // minimize primitive; it stays alive on the desktop display.
+                        //VirtualDisplayTaskManager.moveTaskToBack(task.taskId)
+                        VirtualDisplayTaskManager.focusTask(task.taskId)
+                    }
+                    lifecycleScope.launch {
+                        renderedTaskbarSignature = emptyList()
+                        refreshTaskbar(allowWhenUnfocused = true)
+                    }
+                }
                 container.addView(item, LinearLayout.LayoutParams(
                     if (showAppIcons()) dp(58) else dp(150), dp(48)
                 ).apply { marginEnd = dp(6) })
             }
-            desktopWindows.filter { it.isVisible() }.forEach { win ->
-                if (!shown.add(win.packageName)) return@forEach
-                val item = createAppItem(packageName = win.packageName, label = win.displayLabel, compact = true) { win.bringToFront() }
+            desktopWindows.forEach { win ->
+                if (!win.isVisible() || !shown.add(win.packageName)) return@forEach
+                val item = createAppItem(packageName = win.packageName, label = win.displayLabel, compact = true) {
+                    win.toggleMinimizedFromDock()
+                    lifecycleScope.launch {
+                        renderedTaskbarSignature = emptyList()
+                        refreshTaskbar(allowWhenUnfocused = true)
+                    }
+                }
                 container.addView(item, LinearLayout.LayoutParams(
                     if (showAppIcons()) dp(58) else dp(150), dp(48)
                 ).apply { marginEnd = dp(6) })
@@ -687,7 +767,8 @@ class DesktopShellActivity : ComponentActivity() {
             "修改壁纸",
             if (showAppIcons()) "应用显示：图标" else "应用显示：名称",
             "修改分辨率 / DPI",
-            "刷新应用与任务栏"
+            "刷新应用与任务栏",
+            "退出桌面"
         )
         AlertDialog.Builder(this)
             .setTitle("桌面")
@@ -697,6 +778,10 @@ class DesktopShellActivity : ComponentActivity() {
                     1 -> toggleAppPresentation()
                     2 -> showDisplaySettingsDialog()
                     3 -> lifecycleScope.launch { renderedTaskbarSignature = emptyList(); refreshTaskbar() }
+                    4 -> {
+                        Log.d("DesktopShell", "Exit desktop selected from main context menu")
+                        exitDesktop()
+                    }
                 }
             }
             .show()
@@ -704,7 +789,7 @@ class DesktopShellActivity : ComponentActivity() {
 
     private fun showWallpaperMenu() {
         val currentMode = desktopPrefs.getString("wallpaper_mode", "gradient") ?: "gradient"
-        val choices = arrayOf("系统渐变", "深色渐变", "纯黑", "从设备选择图片")
+        val choices = arrayOf("系统渐变", "深色渐变", "纯黑", "从设备选择图片", "退出桌面")
         val checked = when (currentMode) { "dark" -> 1; "black" -> 2; "image" -> 3; else -> 0 }
         AlertDialog.Builder(this)
             .setTitle("桌面壁纸")
@@ -714,12 +799,20 @@ class DesktopShellActivity : ComponentActivity() {
                     1 -> desktopPrefs.edit().putString("wallpaper_mode", "dark").remove("wallpaper_uri").apply()
                     2 -> desktopPrefs.edit().putString("wallpaper_mode", "black").remove("wallpaper_uri").apply()
                     3 -> { dialog.dismiss(); wallpaperPicker.launch(arrayOf("image/*")); return@setSingleChoiceItems }
+                    4 -> { dialog.dismiss(); exitDesktop() ; return@setSingleChoiceItems }
                 }
                 dialog.dismiss()
                 applyWallpaper()
             }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    private fun exitDesktop() {
+        Log.d("DesktopShell", "Exit desktop requested from wallpaper menu")
+        runCatching { closeAppDrawer() }
+        runCatching { hideDockOverlay() }
+        finishAndRemoveTask()
     }
 
     private fun applyWallpaper() {
@@ -1275,11 +1368,55 @@ class DesktopShellActivity : ComponentActivity() {
         return Settings.canDrawOverlays(this)
     }
 
+    private fun hasFullscreenDesktopApp(): Boolean {
+        val tasks = runCatching { VirtualDisplayTaskManager.findTasks(this, desktopDisplayId) }
+            .getOrDefault(emptyList())
+        return tasks.any { it.packageName != packageName }
+    }
+
+    /**
+     * Re-assert the input/z-order of the interactive overlays. Windows of the
+     * same TYPE_APPLICATION_OVERLAY are ordered by insertion, so the dock and
+     * drawer are re-added after a freeform window is promoted.
+     */
+    internal fun raiseDesktopInteractiveOverlays() {
+        if (isFinishing || isDestroyed) return
+        val drawer = drawerOverlayRoot
+        val drawerWm = drawerOverlayWindowManager
+        val drawerParams = drawerOverlayParams
+        val dock = desktopTaskbar
+        val dockWm = dockOverlayWindowManager
+
+        if (dockOverlayAttached && dock != null && dockWm != null) {
+            runCatching { dockWm.removeViewImmediate(dock) }
+            runCatching { dockWm.addView(dock, currentDockOverlayParams()) }
+        }
+        if (drawer != null && drawerWm != null && drawerParams != null) {
+            runCatching { drawerWm.removeViewImmediate(drawer) }
+            runCatching { drawerWm.addView(drawer, drawerParams) }
+        }
+    }
+
+    private fun currentDockOverlayParams(): WindowManager.LayoutParams =
+        WindowManager.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(68),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            title = "VirtualDisplayDesktopDock-$desktopDisplayId"
+        }
+
     /** Move the existing taskbar into a display-local overlay without rebuilding it. */
     private fun showDockOverlay() {
         val dock = desktopTaskbar ?: return
         if (dockOverlayAttached) {
             dock.visibility = View.VISIBLE
+            raiseDesktopInteractiveOverlays()
             lifecycleScope.launch { refreshTaskbar(allowWhenUnfocused = true) }
             return
         }
@@ -1293,18 +1430,7 @@ class DesktopShellActivity : ComponentActivity() {
             )
         } else createDisplayContext(targetDisplay)
         val wm = displayContext.getSystemService(WindowManager::class.java) ?: return
-        val params = WindowManager.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(68),
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            title = "VirtualDisplayDesktopDock-$desktopDisplayId"
-        }
+        val params = currentDockOverlayParams()
         parent?.removeView(dock)
         dock.setOnTouchListener { _, event ->
             if (event.actionMasked == MotionEvent.ACTION_OUTSIDE) {

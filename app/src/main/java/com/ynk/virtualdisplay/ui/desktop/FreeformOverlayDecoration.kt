@@ -152,6 +152,12 @@ internal class FreeformOverlayDecoration(
     private var hanging = false
     private var minimized = false
     private var mouseButtonDown = false
+    private var savedMinimizedX = initialX
+    private var savedMinimizedY = initialY
+    private var minimizedPositionSaved = false
+    private var drawerShiftActive = false
+    private var drawerSavedX = initialX
+    private var drawerSavedY = initialY
 
     private val windowSession = DesktopWindowSession(desktopDisplay.displayId, packageName)
     private val sessionScope = MainScope()
@@ -412,6 +418,10 @@ internal class FreeformOverlayDecoration(
             activity.bringDesktopWindowToFront(root)
         }
         DesktopWindowInputRouter.bringToFront(windowSession)
+        // Dock / drawer are intentionally the highest interactive overlay.
+        // If a freeform window was just promoted, restore those overlays
+        // above it so their buttons remain clickable when they overlap.
+        activity.raiseDesktopInteractiveOverlays()
     }
 
     private fun prepareTouchEventForVideo(event: MotionEvent): MotionEvent {
@@ -533,19 +543,63 @@ internal class FreeformOverlayDecoration(
         if (released) return
         minimized = !minimized
         if (minimized) {
-        } else {
+            if (!minimizedPositionSaved) {
+                savedMinimizedX = windowX
+                savedMinimizedY = windowY
+                minimizedPositionSaved = true
+            }
+            // The minimized window is completely moved outside the desktop.
+            // Its VirtualDisplay/session stays alive, while the Dock item can
+            // bring the exact window back to its previous coordinates.
+            val screenWidth = desktopDisplay.width
+            windowX = screenWidth + activity.dpPublic(32)
+        } else if (minimizedPositionSaved) {
+            windowX = savedMinimizedX
+            windowY = savedMinimizedY
         }
         val showFullChrome = !minimized
         header.visibility = if (showFullChrome) View.VISIBLE else View.GONE
         content.visibility = if (showFullChrome) View.VISIBLE else View.GONE
         contentBackground.visibility = if (showFullChrome) View.VISIBLE else View.GONE
         veil.visibility = View.GONE
-        bottom.visibility = View.VISIBLE
+        bottom.visibility = if (showFullChrome) View.VISIBLE else View.GONE
         pin.contentDescription = if (minimized) "还原" else "最小化"
         pin.text = if (minimized) "□" else "—"
         applyRootSize()
         updateAttachedLayout()
-        if (showFullChrome) content.requestFocus()
+        if (showFullChrome) {
+            minimizedPositionSaved = true
+            content.requestFocus()
+            bringToFront()
+        }
+    }
+
+    internal fun isMinimizedForLayout(): Boolean = minimized
+
+    /** Dock uses the same toggle semantics as the window button: visible -> minimize,
+     * minimized -> restore to the saved coordinates. */
+    internal fun toggleMinimizedFromDock() {
+        if (released || closing) return
+        toggleMinimized()
+    }
+
+    internal fun moveAsideForDrawer(targetX: Int, screenWidth: Int, index: Int) {
+        if (released || minimized || !attached || drawerShiftActive) return
+        drawerSavedX = windowX
+        drawerSavedY = windowY
+        drawerShiftActive = true
+        val gap = activity.dpPublic(12)
+        val steppedX = targetX + index * activity.dpPublic(48)
+        windowX = steppedX.coerceAtMost((screenWidth - contentWidth).coerceAtLeast(0))
+        updateAttachedLayout()
+    }
+
+    internal fun restoreAfterDrawer() {
+        if (released || !drawerShiftActive) return
+        drawerShiftActive = false
+        windowX = drawerSavedX
+        windowY = drawerSavedY
+        updateAttachedLayout()
     }
 
     private fun toggleHangUp() {
