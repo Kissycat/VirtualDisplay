@@ -71,6 +71,8 @@ class InputController(
     private var trackpadTapCancelled = false
     private var trackpadDragging = false
     private var trackpadModeEnabled = false
+    @Volatile
+    private var desktopModeEnabled = false
     private var trackpadLongPressStarted = false
     private var trackpadLongPressConsumed = false
     private var trackpadTwoFingerStartX = 0f
@@ -124,6 +126,10 @@ class InputController(
         trackpadGestureHandler.removeCallbacks(pendingThreeFingerClickRunnable)
         pendingTwoFingerClick = false
         pendingThreeFingerClick = false
+    }
+
+    fun setDesktopModeEnabled(enabled: Boolean) {
+        desktopModeEnabled = enabled
     }
 
     fun setTrackpadModeEnabled(enabled: Boolean) {
@@ -183,19 +189,38 @@ class InputController(
         trackpadLastTapY = 0f
     }
 
+    private fun invalidateContentRectCache() {
+        cachedContentRect = null
+        cachedRectViewWidth = -1f
+        cachedRectViewHeight = -1f
+        cachedRectVideoWidth = -1
+        cachedRectVideoHeight = -1
+        cachedRectMode = null
+        cachedRectRotation = Int.MIN_VALUE
+    }
+
     fun updateVideoSize(width: Int, height: Int) {
         mainVideoWidth = width
         mainVideoHeight = height
-        videoWidth = width
-        videoHeight = height
+        if (videoWidth != width || videoHeight != height) {
+            videoWidth = width
+            videoHeight = height
+            invalidateContentRectCache()
+        }
     }
 
     fun setDisplayMode(mode: DisplayMode) {
-        displayMode = mode
+        if (displayMode != mode) {
+            displayMode = mode
+            invalidateContentRectCache()
+        }
     }
 
     fun setVideoRotation(rotation: Int) {
-        videoRotation = rotation
+        if (videoRotation != rotation) {
+            videoRotation = rotation
+            invalidateContentRectCache()
+        }
     }
 
     fun hasVideoSize(): Boolean = videoWidth > 0 && videoHeight > 0
@@ -637,6 +662,12 @@ class InputController(
         if (event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) {
             return false
         }
+        if (desktopModeEnabled && DesktopWindowInputRouter.focusedSession() != null) {
+            scope.launch(Dispatchers.IO) {
+                DesktopWindowInputRouter.injectKeyEvent(event)
+            }
+            return true
+        }
         val displayId = displayIdProvider() ?: return false
         scope.launch(Dispatchers.Main.immediate) {
             repository.injectInputWithDisplayId(event, displayId)
@@ -645,6 +676,12 @@ class InputController(
     }
 
     fun injectKey(keyCode: Int) {
+        if (desktopModeEnabled && DesktopWindowInputRouter.focusedSession() != null) {
+            scope.launch(Dispatchers.IO) {
+                DesktopWindowInputRouter.injectKeyCode(keyCode)
+            }
+            return
+        }
         val displayId = displayIdProvider() ?: return
         val now = android.os.SystemClock.uptimeMillis()
         val downEvent = KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0)
@@ -810,9 +847,18 @@ class InputController(
     }
 
     private fun handleDisappearedPointers(event: MotionEvent, contentRect: RectF, displayId: Int) {
-        val currentPointerIds = (0 until event.pointerCount).map { event.getPointerId(it) }.toSet()
-        val disappeared = activePointerIds.filter { it !in currentPointerIds }
-        for (pointerId in disappeared) {
+        if (activePointerIds.isEmpty()) return
+        val iterator = activePointerIds.iterator()
+        while (iterator.hasNext()) {
+            val pointerId = iterator.next()
+            var present = false
+            for (index in 0 until event.pointerCount) {
+                if (event.getPointerId(index) == pointerId) {
+                    present = true
+                    break
+                }
+            }
+            if (present) continue
             val pos = activePointerPositions[pointerId] ?: continue
             val (x, y) = mapToVideo(pos.first, pos.second, contentRect)
             injectPointerEvent(
@@ -828,7 +874,7 @@ class InputController(
                 displayId = displayId,
                 source = InputDevice.SOURCE_TOUCHSCREEN,
             )
-            activePointerIds -= pointerId
+            iterator.remove()
             activePointerPositions.remove(pointerId)
         }
     }
@@ -899,6 +945,12 @@ class InputController(
     }
 
     private var cachedContentRect: RectF? = null
+    private var cachedRectViewWidth = -1f
+    private var cachedRectViewHeight = -1f
+    private var cachedRectVideoWidth = -1
+    private var cachedRectVideoHeight = -1
+    private var cachedRectMode: DisplayMode? = null
+    private var cachedRectRotation = Int.MIN_VALUE
 
     private fun getContentRectForInjection(): RectF? = cachedContentRect
 
@@ -1049,10 +1101,23 @@ class InputController(
         val vh = videoHeight.toFloat()
         if (width <= 0f || height <= 0f || vw <= 0f || vh <= 0f) {
             cachedContentRect = null
+            cachedRectViewWidth = -1f
             return null
         }
 
-        val rect = when (displayMode) {
+        val mode = displayMode
+        val rotation = videoRotation
+        if (cachedContentRect != null &&
+            cachedRectViewWidth == width &&
+            cachedRectViewHeight == height &&
+            cachedRectVideoWidth == videoWidth &&
+            cachedRectVideoHeight == videoHeight &&
+            cachedRectMode == mode &&
+            cachedRectRotation == rotation) {
+            return cachedContentRect
+        }
+
+        val rect = when (mode) {
             DisplayMode.FIT_CENTER -> {
                 val videoAspect = vw / vh
                 val viewAspect = width / height
@@ -1091,6 +1156,12 @@ class InputController(
         }
 
         cachedContentRect = rect
+        cachedRectViewWidth = width
+        cachedRectViewHeight = height
+        cachedRectVideoWidth = videoWidth
+        cachedRectVideoHeight = videoHeight
+        cachedRectMode = mode
+        cachedRectRotation = rotation
         return rect
     }
 

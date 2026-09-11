@@ -1,6 +1,7 @@
 # Release Virtual Display
 
-释放一个已存在的虚拟显示器。释放前会自动将显示上的应用任务迁移回默认主屏（displayId=0）。
+释放一个已存在的虚拟显示器。请求可指定销毁前是否将显示上的应用任务迁移回默认主屏（displayId=0）。
+当 `moveTasksToDefaultDisplay=false` 时，不执行主动迁移，由 Android 系统自行处理显示器销毁后的任务生命周期。
 
 ## Endpoint
 
@@ -17,12 +18,14 @@ CONTROL_MSG_TYPE: 202
 | type         | uint8   | 1 byte | 消息类型，固定值 `202`                               |
 | sequence     | int64   | 8 bytes| 请求序列号，用于匹配响应                             |
 | display_id   | int32   | 4 bytes| 要释放的虚拟显示器 ID                                |
+| move_tasks   | uint8   | 1 byte | `1`=销毁前移回默认主屏，`0`=不迁移，由系统处理           |
 
 ### Kotlin Example
 
 ```kotlin
 val bytes = CustomControlMessage.createReleaseVirtualDisplay(
-    displayId = 2
+    displayId = 2,
+    moveTasksToDefaultDisplay = true,
 )
 // 通过 ControlChannel 发送 bytes
 ```

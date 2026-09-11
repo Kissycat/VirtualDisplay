@@ -118,8 +118,11 @@ class MultiConnectionRepository(
     override suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int, mirrorDisplayId: Int, desktopMode: Boolean): Result<Int> =
         activeSlot?.createDisplay(name, width, height, dpi, flags, mirrorDisplayId, desktopMode) ?: Result.failure(noActiveSlotError())
 
-    override suspend fun releaseDisplay(displayId: Int): Result<Unit> =
-        activeSlot?.releaseDisplay(displayId) ?: Result.failure(noActiveSlotError())
+    override suspend fun releaseDisplay(
+        displayId: Int,
+        moveTasksToDefaultDisplay: Boolean,
+    ): Result<Unit> = activeSlot?.releaseDisplay(displayId, moveTasksToDefaultDisplay)
+        ?: Result.failure(noActiveSlotError())
 
     override suspend fun setDisplaySurface(displayId: Int, surface: Surface?): Result<Unit> =
         activeSlot?.setDisplaySurface(displayId, surface) ?: Result.failure(noActiveSlotError())

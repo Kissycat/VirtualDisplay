@@ -68,6 +68,10 @@ class DisplayActivity : ComponentActivity() {
     private var nodeKey: String? = null
     private var videoWidth = 0
     private var videoHeight = 0
+    // Stable virtual-display dimensions. In desktop mode orientation policy must
+    // follow the virtual screen aspect ratio, not a rotated video frame.
+    private var virtualDisplayWidth = 0
+    private var virtualDisplayHeight = 0
     private var currentVideoRotation = 0
     private var videoDpi = 160
     private var desktopMode = false
@@ -157,6 +161,7 @@ class DisplayActivity : ComponentActivity() {
             displayIdProvider = { remoteDisplayId },
             scope = lifecycleScope,
         )
+        inputController.setDesktopModeEnabled(desktopMode)
         inputController.setTrackpadModeEnabled(trackpadEnabled)
 
         backCallback = object : OnBackPressedCallback(true) {
@@ -603,7 +608,9 @@ class DisplayActivity : ComponentActivity() {
             updateContentRect()
         }
 
-        applyOrientationForVideo(width, height)
+        if (!desktopMode) {
+            applyOrientationForVideo(width, height)
+        }
     }
 
     private fun updateDisplayInfo(displayId: Int) {
@@ -686,6 +693,12 @@ class DisplayActivity : ComponentActivity() {
     }
 
     private fun applyDisplayDimensions(width: Int, height: Int, dpi: Int, isFirstDiscovery: Boolean) {
+        if (width <= 0 || height <= 0) return
+        virtualDisplayWidth = width
+        virtualDisplayHeight = height
+        if (desktopMode) {
+            applyOrientationForVirtualDisplay(width, height)
+        }
         if (videoWidth != width || videoHeight != height) {
             Log.i(TAG, "applyDisplayDimensions: #$remoteDisplayId size=${width}x${height} (prev=${videoWidth}x${videoHeight})")
             videoWidth = width
@@ -729,6 +742,23 @@ class DisplayActivity : ComponentActivity() {
     private fun updateContentRect() {
         if (::inputController.isInitialized && ::rootLayout.isInitialized) {
             inputController.getContentRect(rootLayout)
+        }
+    }
+
+    private fun applyOrientationForVirtualDisplay(width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+        // Desktop mode keeps the orientation axis fixed to the virtual display's
+        // aspect ratio. SENSOR_LANDSCAPE/SENSOR_PORTRAIT allow the two directions
+        // on the same axis (0/180) while preventing 90/270 from changing the
+        // virtual screen between portrait and landscape.
+        val targetOrientation = when {
+            width > height -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            height > width -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            else -> ActivityInfo.SCREEN_ORIENTATION_NOSENSOR
+        }
+        if (requestedOrientation != targetOrientation) {
+            requestedOrientation = targetOrientation
+            Log.i(TAG, "applyOrientationForVirtualDisplay ${width}x${height} -> orientation=$targetOrientation")
         }
     }
 
@@ -950,7 +980,7 @@ class DisplayActivity : ComponentActivity() {
                     event.flags,
                     InputDevice.SOURCE_KEYBOARD,
                 )
-                repository.injectInputWithDisplayId(cleanEvent, remoteDisplayId!!)
+                inputController.handleKeyEvent(cleanEvent)
             }
         }
         return true

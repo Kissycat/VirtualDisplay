@@ -142,8 +142,11 @@ class DisplayInteractor(
     /**
      * 释放指定显示器。
      */
-    suspend fun releaseDisplay(displayId: Int): Result<Unit> {
-        return repository.releaseDisplay(displayId)
+    suspend fun releaseDisplay(
+        displayId: Int,
+        moveTasksToDefaultDisplay: Boolean = true,
+    ): Result<Unit> {
+        return repository.releaseDisplay(displayId, moveTasksToDefaultDisplay)
     }
 
     /**

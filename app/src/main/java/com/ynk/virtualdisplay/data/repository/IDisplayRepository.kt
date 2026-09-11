@@ -60,7 +60,10 @@ interface IDisplayRepository {
     suspend fun createDisplay(name: String, width: Int, height: Int, dpi: Int, flags: Int = 0, mirrorDisplayId: Int = -1, desktopMode: Boolean = false): Result<Int>
 
     /** 释放指定显示器 */
-    suspend fun releaseDisplay(displayId: Int): Result<Unit>
+    suspend fun releaseDisplay(
+        displayId: Int,
+        moveTasksToDefaultDisplay: Boolean = true,
+    ): Result<Unit>
 
     /** 设置显示器 Surface — 驱动客户端 H264 解码器 */
     suspend fun setDisplaySurface(displayId: Int, surface: Surface?): Result<Unit>

@@ -13,6 +13,7 @@ import android.graphics.Rect
 import android.graphics.drawable.Drawable
 import android.graphics.PixelFormat
 import android.os.Bundle
+import android.os.Looper
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.Display
@@ -112,7 +113,9 @@ class DesktopShellActivity : ComponentActivity() {
     internal var desktopDisplayId: Int = Display.DEFAULT_DISPLAY
     private var taskbarAppsContainer: LinearLayout? = null
     private var taskbarMonitorJob: Job? = null
-    private var renderedTaskbarSignature: List<Int> = emptyList()
+    private var renderedTaskbarSignature: List<String> = emptyList()
+    private val appLabelCache = ConcurrentHashMap<String, String>()
+    private val appIconStateCache = ConcurrentHashMap<String, Drawable.ConstantState>()
     private var cachedDrawerApps: List<com.ynk.virtualdisplay.protocol.DeviceMessage.AppEntry> = emptyList()
     private var cachedDrawerAppsAt: Long = 0L
     private var cachedRecentPackages: List<String> = emptyList()
@@ -131,6 +134,7 @@ class DesktopShellActivity : ComponentActivity() {
     private var desktopTaskbar: View? = null
     private var dockOverlayWindowManager: WindowManager? = null
     private var dockOverlayAttached = false
+    private var maximizedDesktopWindowCount = 0
     private val desktopPrefs: SharedPreferences by lazy {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
     }
@@ -282,7 +286,15 @@ class DesktopShellActivity : ComponentActivity() {
     }
 
     internal fun bringDesktopWindowToFront(view: View) {
-        if (view.parent === desktopWindowLayer) view.bringToFront()
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            if (view.parent === desktopWindowLayer) view.bringToFront()
+        } else {
+            view.post {
+                if (!isFinishing && !isDestroyed && view.parent === desktopWindowLayer) {
+                    view.bringToFront()
+                }
+            }
+        }
     }
 
     internal fun removeDesktopWindowView(view: View) {
@@ -415,9 +427,7 @@ class DesktopShellActivity : ComponentActivity() {
         fun addRecentItem(pkg: String, index: Int) {
             val item = createAppItem(
                 packageName = pkg,
-                label = runCatching {
-                    packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
-                }.getOrElse { pkg.substringAfterLast('.') },
+                label = appLabel(pkg),
                 compact = true,
                 onClick = {
                     closeAppDrawer()
@@ -648,16 +658,13 @@ class DesktopShellActivity : ComponentActivity() {
     private fun launchRemoteApp(packageName: String) {
         val displayId = desktopDisplayId
         lifecycleScope.launch(Dispatchers.IO) {
-            val existing = VirtualDisplayTaskManager.findTaskByPackage(
+            val (existing, foreign) = VirtualDisplayTaskManager.findTaskByPackageAcrossDisplays(
                 this@DesktopShellActivity, displayId, packageName
             )
             if (existing != null && VirtualDisplayTaskManager.focusTask(existing.taskId)) {
                 return@launch
             }
 
-            val foreign = VirtualDisplayTaskManager.findTaskOnOtherDisplay(
-                this@DesktopShellActivity, displayId, packageName
-            )
             if (foreign != null && VirtualDisplayTaskManager.moveExistingTaskToDisplay(
                     this@DesktopShellActivity, foreign, displayId
                 )) {
@@ -716,8 +723,25 @@ class DesktopShellActivity : ComponentActivity() {
             cachedRecentPackages = recent
             cachedRecentPackagesAt = now
         }
+
+        // Avoid rebuilding the entire taskbar every polling tick. The monitor
+        // runs periodically because Android task state is queried through
+        // dumpsys; most polls produce an identical task list.
+        val visibleWindowSignature = desktopWindows
+            .asSequence()
+            .filter { it.isVisible() }
+            .map { "w:${it.packageName}:${it.isMinimizedForLayout()}" }
+            .toList()
+        val signature = ArrayList<String>(taskSnapshot.size + visibleWindowSignature.size + 1)
+        signature.add(if (showAppIcons()) "icons" else "labels")
+        taskSnapshot.forEach { signature.add("t:${it.taskId}:${it.packageName}") }
+        signature.addAll(visibleWindowSignature)
+        if (signature == renderedTaskbarSignature) return
+
         withContext(Dispatchers.Main) {
             val container = taskbarAppsContainer ?: return@withContext
+            // State can change while the IO snapshot is being processed;
+            // signature is deliberately assigned only after the UI is rebuilt.
             container.removeAllViews()
             val shown = LinkedHashSet<String>()
             taskSnapshot.forEach { task ->
@@ -725,8 +749,7 @@ class DesktopShellActivity : ComponentActivity() {
                 val window = desktopWindows.firstOrNull { it.packageName == task.packageName }
                 val item = createAppItem(
                     packageName = task.packageName,
-                    label = runCatching { packageManager.getApplicationLabel(packageManager.getApplicationInfo(task.packageName, 0)).toString() }
-                        .getOrElse { task.packageName.substringAfterLast('.') },
+                    label = appLabel(task.packageName),
                     compact = true
                 ) {
                     if (window != null) {
@@ -759,6 +782,7 @@ class DesktopShellActivity : ComponentActivity() {
                     if (showAppIcons()) dp(58) else dp(150), dp(48)
                 ).apply { marginEnd = dp(6) })
             }
+            renderedTaskbarSignature = signature
         }
     }
 
@@ -1333,14 +1357,25 @@ class DesktopShellActivity : ComponentActivity() {
         startActivity(intent)
     }
 
-    private fun appLabel(pkg: String): String = runCatching {
-        packageManager.getApplicationInfo(pkg, 0).loadLabel(packageManager).toString()
-    }.getOrDefault(pkg)
+    private fun appLabel(pkg: String): String {
+        appLabelCache[pkg]?.let { return it }
+        val label = runCatching {
+            packageManager.getApplicationInfo(pkg, 0).loadLabel(packageManager).toString()
+        }.getOrDefault(pkg.substringAfterLast('.'))
+        appLabelCache.putIfAbsent(pkg, label)
+        return label
+    }
 
     private fun loadAppIcon(pkg: String): android.graphics.drawable.Drawable {
-        return runCatching { packageManager.getApplicationIcon(pkg) }.getOrElse {
+        val state = appIconStateCache[pkg]
+        if (state != null) {
+            return state.newDrawable(resources)
+        }
+        val drawable = runCatching { packageManager.getApplicationIcon(pkg) }.getOrElse {
             getDrawable(android.R.drawable.sym_def_app_icon)!!
         }
+        drawable.constantState?.let { appIconStateCache.putIfAbsent(pkg, it) }
+        return drawable
     }
 
     /** Execute a privileged shell command through Shizuku. */
@@ -1538,6 +1573,31 @@ class DesktopShellActivity : ComponentActivity() {
     private fun Int.roundToInt(): Int = this
     private fun Float.roundToInt(): Int = kotlin.math.round(this).toInt()
 
+
+    internal fun onDesktopWindowMaximizedChanged(
+        window: FreeformOverlayDecoration,
+        maximized: Boolean,
+    ) {
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            val visibleMaximizedCount = desktopWindows.count { it !== window && it.isMaximized() } +
+                if (maximized && window.isVisible()) 1 else 0
+            maximizedDesktopWindowCount = visibleMaximizedCount
+            applyMaximizedDockState()
+            lifecycleScope.launch { refreshTaskbar(allowWhenUnfocused = true) }
+        }
+    }
+
+    private fun applyMaximizedDockState() {
+        if (maximizedDesktopWindowCount > 0) {
+            // Docked mode: full width, bottom edge, no floating side gaps.
+            showDockOverlay()
+        } else {
+            // Normal mode: return the existing taskbar to the shell's padded
+            // layout so it becomes the original floating Dock again.
+            hideDockOverlay()
+        }
+    }
 
     internal fun removeDesktopWindowPublic(window: FreeformOverlayDecoration) {
         desktopWindows.remove(window)

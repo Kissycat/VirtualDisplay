@@ -86,8 +86,8 @@ class FreeformChromeActivity : ComponentActivity() {
     }
 
     private fun closeTarget() {
-        if (targetPackage.isBlank()) { finish(); return }
-        shizuku("am force-stop ${shellQuote(targetPackage)}")
+        // The target task is hosted by its virtual display. Releasing that
+        // display lets Android own the task/process cleanup policy.
         finish()
     }
 

@@ -14,7 +14,10 @@ import kotlinx.coroutines.withContext
 
 interface DaemonControlApi {
     suspend fun createDisplay(name: String, w: Int, h: Int, dpi: Int, flags: Int, mirrorDisplayId: Int = -1): Result<Int>
-    suspend fun releaseDisplay(displayId: Int): Result<Unit>
+    suspend fun releaseDisplay(
+        displayId: Int,
+        moveTasksToDefaultDisplay: Boolean = true,
+    ): Result<Unit>
     suspend fun resizeDisplay(displayId: Int, w: Int, h: Int, dpi: Int): Result<Unit>
     suspend fun startActivity(packageName: String, displayId: Int, freeform: Boolean = false): Result<Int>
     suspend fun launchHome(displayId: Int): Result<Int>
@@ -67,8 +70,11 @@ class DaemonControlApiImpl(
         }
     }
 
-    override suspend fun releaseDisplay(displayId: Int): Result<Unit> {
-        val msg = ControlMessage.ReleaseVirtualDisplay(displayId)
+    override suspend fun releaseDisplay(
+        displayId: Int,
+        moveTasksToDefaultDisplay: Boolean,
+    ): Result<Unit> {
+        val msg = ControlMessage.ReleaseVirtualDisplay(displayId, moveTasksToDefaultDisplay)
         val resp = rpc.sendAndAwait(msg) ?: return Result.failure(IOException("Connection error or timeout"))
         return if (resp is DeviceMessage.GenericResponse) {
             if (resp.statusCode == 0) {

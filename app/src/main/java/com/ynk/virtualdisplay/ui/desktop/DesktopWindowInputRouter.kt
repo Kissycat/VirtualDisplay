@@ -18,6 +18,7 @@ internal object DesktopWindowInputRouter {
         val width: Int,
         val height: Int,
         val chromeTop: Int,
+        val promoteVisual: () -> Unit,
     ) {
         fun containsContent(px: Float, py: Float): Boolean =
             width > 0 && height > 0 &&
@@ -34,6 +35,7 @@ internal object DesktopWindowInputRouter {
     private val lock = Any()
     private val entries = LinkedHashMap<DesktopWindowSession, Entry>()
     private var pointerTarget: WeakReference<DesktopWindowSession>? = null
+    private var focusedTarget: WeakReference<DesktopWindowSession>? = null
 
     fun register(
         session: DesktopWindowSession,
@@ -43,9 +45,11 @@ internal object DesktopWindowInputRouter {
         width: Int,
         height: Int,
         chromeTop: Int,
+        promoteVisual: () -> Unit = {},
     ) {
         synchronized(lock) {
-            entries[session] = Entry(session, displayId, x, y, width, height, chromeTop)
+            entries[session] = Entry(session, displayId, x, y, width, height, chromeTop, promoteVisual)
+            focusedTarget = WeakReference(session)
         }
         Log.d(TAG, "register sessionDisplay=${session.windowDisplayId()} parentDisplay=$displayId rect=$x,$y ${width}x$height chromeTop=$chromeTop")
     }
@@ -60,31 +64,65 @@ internal object DesktopWindowInputRouter {
         chromeTop: Int,
     ) {
         synchronized(lock) {
-            if (entries.containsKey(session)) {
-                entries[session] = Entry(session, displayId, x, y, width, height, chromeTop)
+            entries[session]?.let { current ->
+                entries[session] = Entry(
+                    session, displayId, x, y, width, height, chromeTop, current.promoteVisual
+                )
             }
         }
     }
 
     fun bringToFront(session: DesktopWindowSession) {
+        val promote: (() -> Unit)?
         synchronized(lock) {
             val e = entries.remove(session) ?: return
             entries[session] = e
             pointerTarget = WeakReference(session)
+            focusedTarget = WeakReference(session)
+            promote = e.promoteVisual
         }
+        promote?.invoke()
         Log.d(TAG, "front sessionDisplay=${session.windowDisplayId()}")
+    }
+
+    fun clearFocus() {
+        synchronized(lock) {
+            focusedTarget = null
+            pointerTarget = null
+        }
+        Log.d(TAG, "focus cleared")
+    }
+
+    fun focusedSession(): DesktopWindowSession? = synchronized(lock) {
+        focusedTarget?.get()?.takeIf { entries.containsKey(it) }
+    }
+
+    fun focusSession(session: DesktopWindowSession) {
+        if (synchronized(lock) { !entries.containsKey(session) }) return
+        bringToFront(session)
     }
 
     fun unregister(session: DesktopWindowSession) {
         synchronized(lock) {
             entries.remove(session)
             if (pointerTarget?.get() === session) pointerTarget = null
+            if (focusedTarget?.get() === session) focusedTarget = null
         }
         Log.d(TAG, "unregister sessionDisplay=${session.windowDisplayId()}")
     }
 
     private fun findAt(displayId: Int, x: Float, y: Float): Entry? = synchronized(lock) {
         entries.values.asSequence().filter { it.displayId == displayId && it.containsContent(x, y) }.lastOrNull()
+    }
+
+    suspend fun injectKeyEvent(event: android.view.KeyEvent): Boolean {
+        val session = focusedSession() ?: return false
+        return session.injectKeyEvent(event).getOrDefault(false)
+    }
+
+    suspend fun injectKeyCode(keyCode: Int): Boolean {
+        val session = focusedSession() ?: return false
+        return session.injectKeyCode(keyCode).getOrDefault(false)
     }
 
     suspend fun injectPointer(
@@ -107,15 +145,31 @@ internal object DesktopWindowInputRouter {
                 else -> findAt(displayId, x, y)
             }
         }
-        if (target == null) return false
+        if (target == null) {
+            if (action == android.view.MotionEvent.ACTION_DOWN) clearFocus()
+            return false
+        }
 
         if (action == android.view.MotionEvent.ACTION_DOWN) {
-            synchronized(lock) { pointerTarget = WeakReference(target.session) }
+            synchronized(lock) {
+                pointerTarget = WeakReference(target.session)
+                focusedTarget = WeakReference(target.session)
+            }
+            // A click on an exposed part of a window promotes it so subsequent
+            // overlap hit-tests use the same visual stacking order.
+            target.promoteVisual.invoke()
+            synchronized(lock) {
+                val e = entries.remove(target.session)
+                if (e != null) entries[target.session] = e
+            }
         }
 
         val (mappedX, mappedY) = target.mapPoint(x, y)
         val (iw, ih) = target.session.inputCoordinateSize(target.width, target.height)
-        Log.d(TAG, "inject display=$displayId -> session=${target.session.windowDisplayId()} action=$action parent=${x.toInt()},${y.toInt()} local=$mappedX,$mappedY size=${iw}x$ih")
+        if (action != android.view.MotionEvent.ACTION_HOVER_MOVE &&
+            action != android.view.MotionEvent.ACTION_HOVER_ENTER) {
+            Log.d(TAG, "inject display=$displayId -> session=${target.session.windowDisplayId()} action=$action parent=${x.toInt()},${y.toInt()} local=$mappedX,$mappedY size=${iw}x$ih")
+        }
         val result = target.session.injectMouseEvent(action, pointerId, mappedX, mappedY, iw, ih, actionButton, buttons)
         if (action == android.view.MotionEvent.ACTION_UP || action == android.view.MotionEvent.ACTION_CANCEL) {
             synchronized(lock) { pointerTarget = null }
@@ -136,7 +190,9 @@ internal object DesktopWindowInputRouter {
         val target = findAt(displayId, x, y) ?: return false
         val (mappedX, mappedY) = target.mapPoint(x, y)
         val (iw, ih) = target.session.inputCoordinateSize(target.width, target.height)
-        Log.d(TAG, "scroll display=$displayId -> session=${target.session.windowDisplayId()} local=$mappedX,$mappedY")
+        if (hScroll != 0f || vScroll != 0f) {
+            Log.d(TAG, "scroll display=$displayId -> session=${target.session.windowDisplayId()} local=$mappedX,$mappedY")
+        }
         return target.session.injectScrollEvent(mappedX, mappedY, iw, ih, hScroll, vScroll, buttons).getOrDefault(false)
     }
 }

@@ -417,9 +417,12 @@ class DaemonDisplayRepository(
         return result
     }
 
-    override suspend fun releaseDisplay(displayId: Int): Result<Unit> {
+    override suspend fun releaseDisplay(
+        displayId: Int,
+        moveTasksToDefaultDisplay: Boolean,
+    ): Result<Unit> {
         // 释放显示器 → Remote DataSource
-        val result = remoteDataSource.releaseDisplay(displayId)
+        val result = remoteDataSource.releaseDisplay(displayId, moveTasksToDefaultDisplay)
         result.onSuccess {
             val currentNode = AppSettings.getCurrentServerNodeSync()
             AppSettings.removeDisplayForServer(context, currentNode, displayId)

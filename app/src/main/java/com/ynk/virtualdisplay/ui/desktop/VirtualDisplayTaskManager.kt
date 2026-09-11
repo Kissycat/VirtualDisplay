@@ -56,6 +56,34 @@ object VirtualDisplayTaskManager {
     fun findTaskById(context: Context, displayId: Int, taskId: Int): TaskInfo? =
         findTasks(context, displayId).firstOrNull { it.taskId == taskId }
 
+    /**
+     * Resolve both the task on the target display and a possible task on any
+     * other display with one activity-manager dump. Launching an app from the
+     * desktop used to perform these two lookups independently, which doubled
+     * the expensive `dumpsys activity activities` work on every click.
+     */
+    fun findTaskByPackageAcrossDisplays(
+        context: Context,
+        targetDisplayId: Int,
+        packageName: String,
+    ): Pair<TaskInfo?, TaskInfo?> {
+        if (targetDisplayId < 0 || packageName.isBlank() || !Shizuku.pingBinder()) {
+            return null to null
+        }
+        return runCatching {
+            val all = parseTasks(context.packageName, parseDump(runShizuku("dumpsys activity activities")))
+            val sameDisplay = all.firstOrNull {
+                it.displayId == targetDisplayId && it.packageName == packageName
+            }
+            val otherDisplay = all.firstOrNull {
+                it.displayId >= 0 && it.displayId != targetDisplayId && it.packageName == packageName
+            }
+            sameDisplay to otherDisplay
+        }.onFailure {
+            Log.w(TAG, "findTaskByPackageAcrossDisplays failed package=$packageName target=$targetDisplayId", it)
+        }.getOrDefault(null to null)
+    }
+
     /** Find an existing task for a package that currently lives on another display. */
     fun findTaskOnOtherDisplay(context: Context, targetDisplayId: Int, packageName: String): TaskInfo? {
         if (targetDisplayId < 0 || !Shizuku.pingBinder()) return null
