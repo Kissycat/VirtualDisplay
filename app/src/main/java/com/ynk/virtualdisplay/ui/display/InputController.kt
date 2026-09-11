@@ -980,6 +980,43 @@ class InputController(
 
         if (trackpadModeEnabled && source == InputDevice.SOURCE_MOUSE) {
             scope.launch(Dispatchers.Main.immediate) {
+                val contextMenuHandled = runCatching {
+                    com.ynk.virtualdisplay.ui.desktop.DesktopShellActivity.dispatchPointerToContextMenu(
+                        displayId = displayId,
+                        action = action,
+                        x = x,
+                        y = y,
+                        actionButton = actionButton,
+                        buttons = buttons,
+                    )
+                }.getOrDefault(false)
+                if (contextMenuHandled) return@launch
+
+                val uiHandled = runCatching {
+                    com.ynk.virtualdisplay.ui.desktop.DesktopShellActivity.dispatchPointerToDrawer(
+                        displayId = displayId,
+                        action = action,
+                        x = x,
+                        y = y,
+                        actionButton = actionButton,
+                        buttons = buttons,
+                    )
+                }.getOrDefault(false)
+                if (uiHandled) return@launch
+
+                val dockHidden: Boolean = runCatching {
+                    com.ynk.virtualdisplay.ui.desktop.DesktopShellActivity.hideFloatingDockOnOutsideClick(
+                        displayId = displayId,
+                        action = action,
+                        x = x,
+                        y = y,
+                    )
+                }.getOrDefault(false)
+                if (dockHidden && action == MotionEvent.ACTION_DOWN) {
+                    // A single outside click hides the forced floating Dock but
+                    // continues to the normal desktop/full-screen input target.
+                }
+
                 val routed = runCatching {
                     DesktopWindowInputRouter.injectPointer(
                         displayId = displayId,

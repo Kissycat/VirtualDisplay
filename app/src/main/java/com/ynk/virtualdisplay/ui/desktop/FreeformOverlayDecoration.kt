@@ -20,6 +20,7 @@ import android.view.MotionEvent
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -155,7 +156,7 @@ internal class FreeformOverlayDecoration(
         setBackgroundColor(Color.BLACK)
     }
     private val content = TextureView(activity).apply {
-        isOpaque = false
+        isOpaque = true
     }
 
     private var attached = false
@@ -212,10 +213,7 @@ internal class FreeformOverlayDecoration(
     private var resizeRight = true
     private var gestureDownY = 0f
     private var gestureDownX = 0f
-				private var lastTapUpTime = 0L
-    private var lastTapUpX = 0f
-    private var lastTapUpY = 0f
-    private var doubleTapDragArmed = false
+    private var headerDragging = false
 
     private val topChrome = activity.dpPublic(HEADER_DP)
     private val bottomChrome = activity.dpPublic(FOOTER_DP)
@@ -263,6 +261,16 @@ internal class FreeformOverlayDecoration(
         bottom.addView(pill, FrameLayout.LayoutParams(activity.dpPublic(112), activity.dpPublic(6), Gravity.CENTER))
         bottom.addView(leftScale, FrameLayout.LayoutParams(activity.dpPublic(22), bottomChrome, Gravity.START))
         bottom.addView(rightScale, FrameLayout.LayoutParams(activity.dpPublic(22), bottomChrome, Gravity.END))
+        
+        // Only decoration controls are allowed to participate in WindowManager
+        // touch dispatch. The video/content region remains routed by
+        // InputController, so a display-local overlay cannot swallow fullscreen
+        // application mouse input.
+        header.tag = DesktopWindowOverlayHost.CHROME_TOUCH_TAG
+        bottom.tag = DesktopWindowOverlayHost.CHROME_TOUCH_TAG
+        fullscreenButton.tag = DesktopWindowOverlayHost.CHROME_TOUCH_TAG
+        leftScale.tag = DesktopWindowOverlayHost.CHROME_TOUCH_TAG
+        rightScale.tag = DesktopWindowOverlayHost.CHROME_TOUCH_TAG
 
         header.setOnTouchListener { _, event -> focusFromUiTouch(event); handleMove(event) }
         bottom.setOnTouchListener { _, event -> focusFromUiTouch(event); handlePill(event) }
@@ -378,10 +386,9 @@ internal class FreeformOverlayDecoration(
     }
 
     /**
-     * Desktop windows are hosted in the DesktopShellActivity's single in-display
-     * View hierarchy. Never remove/re-add the root merely to change z-order:
-     * doing so detaches TextureView and destroys its SurfaceTexture, producing
-     * a black flash and interrupting the video stream.
+     * Attach the decoration into the dedicated display-local application overlay.
+     * The host is independent from DesktopShellActivity's content hierarchy, so
+     * the window remains visible above a fullscreen foreground app.
      */
     private fun attachAsDisplayOverlay() {
         if (overlayAttached || root.parent != null) return
@@ -390,11 +397,14 @@ internal class FreeformOverlayDecoration(
             contentWidth,
             contentHeight + if (hanging) 0 else topChrome + bottomChrome,
             windowX,
-            windowY
+            windowY,
         )
+        // The actual WindowManager overlay is owned by DesktopWindowOverlayHost.
+        // These legacy fields intentionally remain null so no second WindowManager
+        // window is ever created for the same TextureView.
         overlayWm = null
         overlayParams = null
-        overlayAttached = false
+        overlayAttached = true
     }
 
     fun show() {
@@ -410,11 +420,15 @@ internal class FreeformOverlayDecoration(
             DesktopWindowInputRouter.register(
                 windowSession, desktopDisplay.displayId, windowX, windowY,
                 contentWidth, contentHeight, if (hanging) 0 else topChrome,
-                promoteVisual = { promoteVisualWindow() }
+                root = root,
+                promoteVisual = { promoteVisualWindow() },
+                setOverlayInteractive = { interactive ->
+                    activity.setDesktopWindowOverlayInteractive(interactive)
+                }
             )
             true
         }.onFailure {
-            activity.logDesktopWindow("Failed to attach desktop window to shell layer", it)
+            activity.logDesktopWindow("Failed to attach desktop window overlay", it)
         }.getOrDefault(false)
         if (!attached) {
             releaseSilently()
@@ -450,7 +464,10 @@ internal class FreeformOverlayDecoration(
 
     private fun focusFromUiTouch(event: MotionEvent) {
         if (!released && event.actionMasked == MotionEvent.ACTION_DOWN) {
-            DesktopWindowInputRouter.focusSession(windowSession)
+            // Focus is logical state only. Do not reorder the actual View tree
+            // during ACTION_DOWN; doing so can invalidate an in-flight gesture
+            // on some Android input dispatchers.
+            DesktopWindowInputRouter.focusSession(windowSession, promote = false)
         }
     }
 
@@ -482,19 +499,38 @@ internal class FreeformOverlayDecoration(
                 dragStartRawY = event.rawY
                 dragBaseX = windowX
                 dragBaseY = windowY
+                headerDragging = false
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                windowX = dragBaseX + (event.rawX - dragStartRawX).roundToInt()
-                windowY = dragBaseY + (event.rawY - dragStartRawY).roundToInt()
-                // Move the actual top-level overlay on every pointer sample;
-                // using the shell-layer helper here only updated the final
-                // position after the drag ended.
-                updateAttachedLayout()
+                val dx = event.rawX - dragStartRawX
+                val dy = event.rawY - dragStartRawY
+                val slop = ViewConfiguration.get(activity).scaledTouchSlop.toFloat()
+                if (!headerDragging && (kotlin.math.abs(dx) > slop || kotlin.math.abs(dy) > slop)) {
+                    headerDragging = true
+                }
+                if (headerDragging) {
+                    windowX = dragBaseX + dx.roundToInt()
+                    windowY = dragBaseY + dy.roundToInt()
+                    updateAttachedLayout()
+                }
                 return true
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+            MotionEvent.ACTION_UP -> {
                 clampInScreen()
+                if (!headerDragging) {
+                    // A click may promote the window, but only after the touch
+                    // sequence has ended so a second tap can safely start a drag.
+                    DesktopWindowInputRouter.bringToFront(windowSession)
+                }
+                headerDragging = false
+                activity.commitDesktopWindowOverlayGeometry(root)
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                headerDragging = false
+                clampInScreen()
+                activity.commitDesktopWindowOverlayGeometry(root)
                 return true
             }
         }
@@ -534,6 +570,7 @@ internal class FreeformOverlayDecoration(
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 veil.visibility = View.GONE
                 clampInScreen()
+                activity.commitDesktopWindowOverlayGeometry(root)
                 return true
             }
         }
@@ -570,27 +607,6 @@ internal class FreeformOverlayDecoration(
         }
         return true
     }
-    
-    private fun maximize() {
-        if (released) return
-        if (minimized) toggleMinimized()
-        val targetW = desktopDisplay.width.coerceAtLeast(activity.dpPublic(MIN_W_DP))
-        val targetH = desktopDisplay.height.coerceAtLeast(activity.dpPublic(MIN_H_DP))
-        val targetDpi = activity.desktopDpiPublic()
-        // The transition follows the requested LMO-style semantics: first
-        // synchronize the private window display to the desktop geometry, then
-        // repatriate the app to the DesktopShell's main display. The old window
-        // session is removed only after the launch/move request is issued.
-        sessionScope.launch(Dispatchers.IO) {
-            runCatching { windowSession.resize(targetW, targetH, targetDpi) }
-                .onFailure { activity.logDesktopWindow("pre-maximize display resize failed", it) }
-            withContext(kotlinx.coroutines.Dispatchers.Main) {
-																delay(100)
-                activity.migrateDesktopWindowToMainDisplay(packageName)
-                closeWindow()
-            }
-        }
-    }
 
     private fun toggleMinimized() {
         if (released) return
@@ -621,10 +637,14 @@ internal class FreeformOverlayDecoration(
         pin.text = if (minimized) "□" else "—"
         applyRootSize()
         updateAttachedLayout()
+        activity.commitDesktopWindowOverlayGeometry(root)
         if (showFullChrome) {
             minimizedPositionSaved = true
             content.requestFocus()
             bringToFront()
+            if (maximized) activity.onDesktopWindowMaximizedChanged(this, true)
+        } else if (maximized) {
+            activity.onDesktopWindowMaximizedChanged(this, true)
         }
     }
 
@@ -635,25 +655,6 @@ internal class FreeformOverlayDecoration(
     internal fun toggleMinimizedFromDock() {
         if (released || closing) return
         toggleMinimized()
-    }
-
-    internal fun moveAsideForDrawer(targetX: Int, screenWidth: Int, index: Int) {
-        if (released || minimized || !attached || drawerShiftActive) return
-        drawerSavedX = windowX
-        drawerSavedY = windowY
-        drawerShiftActive = true
-        val gap = activity.dpPublic(12)
-        val steppedX = targetX + index * activity.dpPublic(48)
-        windowX = steppedX.coerceAtMost((screenWidth - contentWidth).coerceAtLeast(0))
-        updateAttachedLayout()
-    }
-
-    internal fun restoreAfterDrawer() {
-        if (released || !drawerShiftActive) return
-        drawerShiftActive = false
-        windowX = drawerSavedX
-        windowY = drawerSavedY
-        updateAttachedLayout()
     }
 
     private fun toggleHangUp() {
@@ -680,6 +681,27 @@ internal class FreeformOverlayDecoration(
         updateAttachedLayout()
     }
 
+    private fun maximize() {
+        if (released) return
+        if (minimized) toggleMinimized()
+        val targetW = desktopDisplay.width.coerceAtLeast(activity.dpPublic(MIN_W_DP))
+        val targetH = desktopDisplay.height.coerceAtLeast(activity.dpPublic(MIN_H_DP))
+        val targetDpi = activity.desktopDpiPublic()
+        // The transition follows the requested LMO-style semantics: first
+        // synchronize the private window display to the desktop geometry, then
+        // repatriate the app to the DesktopShell's main display. The old window
+        // session is removed only after the launch/move request is issued.
+        sessionScope.launch(Dispatchers.IO) {
+            runCatching { windowSession.resize(targetW, targetH, targetDpi) }
+                .onFailure { activity.logDesktopWindow("pre-maximize display resize failed", it) }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+																delay(100)
+                activity.migrateDesktopWindowToMainDisplay(packageName)
+                closeWindow()
+            }
+        }
+    }
+    
     private fun toggleMaximized() {
         if (released) return
         if (minimized) toggleMinimized()
@@ -693,9 +715,14 @@ internal class FreeformOverlayDecoration(
             maximized = true
             windowX = 0
             windowY = 0
+            // Maximized content occupies the area above the Dock. The bottom
+            // decoration bar disappears completely in this state.
             contentWidth = desktopDisplay.width.coerceAtLeast(activity.dpPublic(MIN_W_DP))
-            contentHeight = (desktopDisplay.height - topChrome - bottomChrome)
+            contentHeight = (desktopDisplay.height - topChrome - activity.desktopDockHeightPublic())
                 .coerceAtLeast(activity.dpPublic(MIN_H_DP))
+            header.visibility = View.VISIBLE
+            fullscreenButton.visibility = View.VISIBLE
+            bottom.visibility = View.GONE
             maximizeButton.text = "❐"
             maximizeButton.contentDescription = "还原窗口大小"
         } else {
@@ -704,17 +731,23 @@ internal class FreeformOverlayDecoration(
             windowY = maximizedSavedY
             contentWidth = maximizedSavedW.coerceAtLeast(activity.dpPublic(MIN_W_DP))
             contentHeight = maximizedSavedH.coerceAtLeast(activity.dpPublic(MIN_H_DP))
+            bottom.visibility = View.VISIBLE
             maximizeButton.text = "□"
             maximizeButton.contentDescription = "最大化"
         }
 
         applyRootSize()
         clampInScreen()
+        activity.commitDesktopWindowOverlayGeometry(root)
         scheduleSessionResize()
         activity.onDesktopWindowMaximizedChanged(this, maximized)
         if (!maximized) {
             bringToFront()
         }
+    }
+
+    internal fun toggleMaximizedFromDock() {
+        toggleMaximized()
     }
 
     /** Historical fullscreen behavior: migrate the app from its private display
@@ -740,6 +773,7 @@ internal class FreeformOverlayDecoration(
         val chromeHeight = when {
             hanging -> 0
             minimized -> bottomChrome
+            maximized -> topChrome
             else -> topChrome + bottomChrome
         }
         (content.layoutParams as? FrameLayout.LayoutParams)?.let {
@@ -782,6 +816,8 @@ internal class FreeformOverlayDecoration(
             it.width = contentWidth
             it.height = bottomChrome
             it.topMargin = if (minimized) 0 else topChrome + contentHeight
+            it.width = if (maximized || minimized || hanging) 0 else contentWidth
+            it.height = if (maximized || minimized || hanging) 0 else bottomChrome
             bottom.layoutParams = it
         }
         (exitTrigger.layoutParams as? FrameLayout.LayoutParams)?.let {
@@ -825,7 +861,11 @@ internal class FreeformOverlayDecoration(
 
     private fun updateAttachedLayout() {
         if (!attached || released) return
-        val chromeHeight = if (hanging) 0 else topChrome + bottomChrome
+        val chromeHeight = when {
+            hanging -> 0
+            maximized -> topChrome
+            else -> topChrome + bottomChrome
+        }
         activity.updateDesktopWindowView(
             root,
             contentWidth,
